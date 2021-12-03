@@ -50,7 +50,8 @@ export const spec = {
         data = tryAppendQueryString(data, 'imark', '1');
       }
       data = tryAppendQueryString(data, 'tp', bidderRequest.refererInfo.referer);
-      const hyperId = validReq.userId.novatiq ? validReq.userId.novatiq.snowflake : null;
+      console.log(`window.nlocvalue = ${window.nlocvalue}`);
+      const hyperId = window.nlocvalue === 1 && validReq.userId.novatiq ? validReq.userId.novatiq.snowflake : null;
       if (hyperId != null) {
         data = tryAppendQueryString(data, 'hyper_id', hyperId);
       }
