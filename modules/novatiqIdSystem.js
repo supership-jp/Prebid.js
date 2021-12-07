@@ -50,7 +50,7 @@ export const novatiqIdSubmodule = {
     const srcId = this.getSrcId(configParams);
 
     const novatiqId = snowflakeId();
-    const url = 'https://spadsync.com/sync?sptoken=' + novatiqId;
+    const url = 'https://spadsync.com/sync?sptoken=' + novatiqId + '&sspid=' + srcId;
 
     function getNlocvalue(cb){
       ajax(url,
