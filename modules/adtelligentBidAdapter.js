@@ -3,7 +3,7 @@ import { registerBidder } from '../src/adapters/bidderFactory.js';
 import { ADPOD, BANNER, VIDEO } from '../src/mediaTypes.js';
 import { config } from '../src/config.js';
 import { Renderer } from '../src/Renderer.js';
-import find from 'core-js-pure/features/array/find.js';
+import find from 'prebidjs-polyfill/find.js';
 
 const subdomainSuffixes = ['', 1, 2];
 const AUCTION_PATH = '/v2/auction/';
@@ -20,6 +20,7 @@ const HOST_GETTERS = {
   onefiftytwomedia: () => 'ghb.ads.152media.com',
   mediafuse: () => 'ghb.hbmp.mediafuse.com',
   bidsxchange: () => 'ghb.hbd.bidsxchange.com',
+  streamkey: () => 'ghb.hb.streamkey.net',
 }
 const getUri = function (bidderCode) {
   let bidderWithoutSuffix = bidderCode.split('_')[0];
@@ -35,7 +36,7 @@ const syncsCache = {};
 export const spec = {
   code: BIDDER_CODE,
   gvlid: 410,
-  aliases: ['onefiftytwomedia', 'selectmedia', 'appaloosa', 'bidsxchange',
+  aliases: ['onefiftytwomedia', 'selectmedia', 'appaloosa', 'bidsxchange', 'streamkey',
     { code: 'navelix', gvlid: 380 },
     {
       code: 'mediafuse',
