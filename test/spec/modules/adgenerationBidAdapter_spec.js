@@ -112,14 +112,14 @@ describe('AdgenerationAdapter', function () {
     ];
     const bidderRequest = {
       refererInfo: {
-        referer: 'https://example.com'
+        page: 'https://example.com'
       }
     };
     const data = {
-      banner: `posall=SSPLOC&id=58278&sdktype=0&hb=true&t=json3&sizes=300x250%2C320x100&currency=JPY&pbver=${prebid.version}&sdkname=prebidjs&adapterver=1.3.0&imark=1&tp=https%3A%2F%2Fexample.com`,
-      bannerUSD: `posall=SSPLOC&id=58278&sdktype=0&hb=true&t=json3&sizes=300x250%2C320x100&currency=USD&pbver=${prebid.version}&sdkname=prebidjs&adapterver=1.3.0&imark=1&tp=https%3A%2F%2Fexample.com`,
-      native: `posall=SSPLOC&id=58278&sdktype=0&hb=true&t=json3&sizes=1x1&currency=JPY&pbver=${prebid.version}&sdkname=prebidjs&adapterver=1.3.0&tp=https%3A%2F%2Fexample.com`,
-      bannerWithUserIdObject: `posall=SSPLOC&id=58278&sdktype=0&hb=true&t=json3&sizes=320x100&currency=JPY&pbver=${prebid.version}&sdkname=prebidjs&adapterver=1.3.0&imark=1&tp=https%3A%2F%2Fexample.com&hyper_id=novatiqId&adgext_criteo_id=1111&adgext_id5_id=1111`,
+      banner: `posall=SSPLOC&id=58278&sdktype=0&hb=true&t=json3&sizes=300x250%2C320x100&currency=JPY&pbver=${prebid.version}&sdkname=prebidjs&adapterver=1.4.0&imark=1&tp=https%3A%2F%2Fexample.com`,
+      bannerUSD: `posall=SSPLOC&id=58278&sdktype=0&hb=true&t=json3&sizes=300x250%2C320x100&currency=USD&pbver=${prebid.version}&sdkname=prebidjs&adapterver=1.4.0&imark=1&tp=https%3A%2F%2Fexample.com`,
+      native: `posall=SSPLOC&id=58278&sdktype=0&hb=true&t=json3&sizes=1x1&currency=JPY&pbver=${prebid.version}&sdkname=prebidjs&adapterver=1.4.0&tp=https%3A%2F%2Fexample.com`,
+      bannerWithUserIdObject: `posall=SSPLOC&id=58278&sdktype=0&hb=true&t=json3&sizes=320x100&currency=JPY&pbver=${prebid.version}&sdkname=prebidjs&adapterver=1.4.0&imark=1&tp=https%3A%2F%2Fexample.com&hyper_id=novatiqId&adgext_criteo_id=1111&adgext_id5_id=1111`,
     };
     it('sends bid request to ENDPOINT via GET', function () {
       const request = spec.buildRequests(bidRequests, bidderRequest)[0];
