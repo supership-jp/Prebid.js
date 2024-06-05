@@ -15,6 +15,9 @@ import {escapeUnsafeChars} from '../libraries/htmlEscape/htmlEscape.js';
  */
 
 const ADG_BIDDER_CODE = 'adgeneration';
+const KEY_VALUE_PREFIX = 'label_';
+const FPDTargets = ['ortb2.user.data', 'ortb2.user.ext.data'];
+
 
 export const spec = {
   code: ADG_BIDDER_CODE,
@@ -52,6 +55,8 @@ export const spec = {
       const gpid = deepAccess(validReq, 'ortb2Imp.ext.gpid');
       const sua = deepAccess(validReq, 'ortb2.device.sua');
       const uid2 = deepAccess(validReq, 'userId.uid2.id');
+      const fpds = getFPD(validReq);
+
       let data = ``;
       data = tryAppendQueryString(data, 'posall', 'SSPLOC');
       const id = getBidIdParameter('id', validReq.params);
@@ -80,11 +85,22 @@ export const spec = {
       }
 
       data = tryAppendQueryString(data, 'tp', bidderRequest.refererInfo.page);
+      // console.log("bidderRequest.refererInfo", bidderRequest.refererInfo);
 
       const hyperId = getHyperId(validReq);
       if (hyperId != null) {
         data = tryAppendQueryString(data, 'hyper_id', hyperId);
       }
+
+      let tmp = '';
+      for (const fpd of fpds) {
+        // console.log(`fpd key : ${fpd.key} , fpd value : ${fpd.value}, ${fpd}`)
+        if (fpd.key && fpd.value) {
+          tmp = tryAppendQueryString(tmp, encodeURIComponent(fpd.key), fpd.value);
+        }
+      }
+
+      // console.log(`tmp string :  \n ${decodeURIComponent(tmp)} length : ${decodeURIComponent(tmp).length} length : ${tmp.length}`);
 
       // remove the trailing "&"
       if (data.lastIndexOf('&') === data.length - 1) {
@@ -335,6 +351,97 @@ function getHyperId(validReq) {
     return validReq.userId.novatiq.snowflake.id;
   }
   return null;
+}
+
+/**
+ *
+ *
+ * @param {Object} obj
+ * @returns {boolean}
+ */
+
+function isObjectOrArray(obj) {
+  const validTypes = ['[object Object]', '[object Array]'];
+  return validTypes.indexOf(Object.prototype.toString.call(obj)) > -1;
+}
+
+function isString(obj) {
+  return Object.prototype.toString.call(obj) === '[object String]';
+}
+
+/**
+ *
+ * @param {Object} obj
+ * @param {*} parentKey
+ * @param {*} result
+ * @returns
+ */
+function flattenObject(obj, parentKey = '', result = []) {
+  if (!isObjectOrArray(obj)) {
+    // only object or array can be flatten
+    // 余計な検討を省くために、objectかarray以外は無視する
+    return result;
+  }
+  for (let key in obj) {
+    if (!obj.hasOwnProperty(key)) {
+      // exclude prototype chain
+      continue;
+    }
+
+    let newKey;
+    if (Array.isArray(obj)) {
+      newKey = parentKey ? `${parentKey}[]` : key;
+    } else {
+      newKey = parentKey ? `${parentKey}[${key}]` : key;
+    }
+    if (typeof obj[key] === 'object' && obj[key] !== null && !Array.isArray(obj)) {
+      flattenObject(obj[key], newKey, result);
+    } else if (Array.isArray(obj[key])) {
+      const objects = [];
+      const strings = [];
+      obj[key].forEach((item, index) => {
+        if (isString(item)) {
+          strings.push(item);
+        } else if (isObjectOrArray(item)) {
+          objects.push(item);
+        }
+      });
+      objects.forEach((item) => {
+        flattenObject(item, newKey, result);
+      });
+
+      result.push({
+        key: newKey,
+        value: strings.join(',')
+      })
+    } else {
+      result.push({
+        key: newKey,
+        value: obj[key]
+      })
+    }
+  }
+  return result;
+}
+
+/**
+ *
+ * @param {*} targetPath ortb2.user.data
+ * @returns label_ortb2[user][data]
+ */
+function createPathKey(targetPath) {
+  return targetPath.split('.').reduce((acc, cur) => {
+    if (acc === KEY_VALUE_PREFIX) return `${acc}${cur}`;
+    return `${acc}[${cur}]`;
+  }, KEY_VALUE_PREFIX);
+}
+
+function getFPD(validReq) {
+  return FPDTargets.map((key) => {
+    return flattenObject(deepAccess(validReq, key), createPathKey(key));
+  }).reduce((acc, cur) => {
+    return acc.concat(cur);
+  }, []);
 }
 
 registerBidder(spec);
