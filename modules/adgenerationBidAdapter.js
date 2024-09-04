@@ -4,6 +4,7 @@ import {BANNER, NATIVE} from '../src/mediaTypes.js';
 import {config} from '../src/config.js';
 import {escapeUnsafeChars} from '../libraries/htmlEscape/htmlEscape.js';
 import {ortbConverter} from '../libraries/ortbConverter/converter.js';
+import {tryAppendQueryString} from '../libraries/urlUtils/urlUtils.js';
 const adgLogger = prefixLog('Adgeneration: ');
 
 /**
@@ -16,8 +17,8 @@ const adgLogger = prefixLog('Adgeneration: ');
 
 const ADG_BIDDER_CODE = 'adgeneration';
 const ADGENE_PREBID_VERSION = '1.6.4.dev';
-const DEBUG_URL = 'https://api-test.scaleout.jp/adsv/v1';
-const URL = 'https://d.socdm.com/adsv/v1';
+const DEBUG_URL = 'https://api-test.scaleout.jp/adgen/prebid';
+const URL = 'https://d.socdm.com/adgen/prebid';
 
 const converter = ortbConverter({
   context: {
@@ -114,10 +115,14 @@ export const spec = {
     if (!body.results || body.results.length < 1) {
       return [];
     }
-    const adResult = body.results[0];
 
-    const targetImp = bidRequests.data.pb_ortb2.imp[0];
-    const requestId = targetImp.id;
+    if (!bidRequests?.data?.ortb?.imp || bidRequests?.data?.ortb?.imp.length < 1) {
+      return [];
+    }
+
+    const adResult = body?.results[0];
+    const targetImp = bidRequests?.data?.ortb?.imp[0];
+    const requestId = targetImp?.id;
 
     const bidResponse = {
       requestId: requestId,
@@ -125,18 +130,18 @@ export const spec = {
       width: adResult.w ? adResult.w : 1,
       height: adResult.h ? adResult.h : 1,
       creativeId: adResult || '',
-      dealId: body.dealid || '',
+      dealId: adResult.dealid || '',
       currency: getCurrencyType(),
       netRevenue: true,
       ttl: adResult.ttl || 10,
     };
-    if (body.adomain && Array.isArray(body.adomain) && body.adomain.length) {
+    if (adResult.adomain && Array.isArray(adResult.adomain) && adResult.adomain.length) {
       bidResponse.meta = {
-        advertiserDomains: body.adomain
+        advertiserDomains: adResult.adomain
       }
     }
-    if (isNative(body)) {
-      bidResponse.native = createNativeAd(body.native_ad, body.beaconurl);
+    if (isNative(adResult)) {
+      bidResponse.native = createNativeAd(adResult.native, adResult.beaconurl);
       bidResponse.mediaType = NATIVE;
     } else {
       // banner
@@ -181,9 +186,9 @@ function isUpperBillboard(locationParams) {
   return false;
 }
 
-function isNative(body) {
-  if (!body) return false;
-  return body.native_ad && body.native_ad.assets.length > 0;
+function isNative(adResult) {
+  if (!adResult) return false;
+  return adResult.native && adResult.native.assets.length > 0;
 }
 
 function createNativeAd(nativeAd, beaconUrl) {
