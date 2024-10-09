@@ -144,7 +144,7 @@ export const spec = {
       cpm: adResult.cpm || 0,
       width: adResult.w ? adResult.w : 1,
       height: adResult.h ? adResult.h : 1,
-      creativeId: adResult || '',
+      creativeId: adResult.creativeid || '',
       dealId: adResult.dealid || '',
       currency: getCurrencyType(),
       netRevenue: true,
