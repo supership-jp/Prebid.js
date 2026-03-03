@@ -3,8 +3,10 @@ import { getCurrencyFromBidderRequest } from '../libraries/ortb2Utils/currency.j
 import { tryAppendQueryString } from '../libraries/urlUtils/urlUtils.js';
 import { registerBidder } from '../src/adapters/bidderFactory.js';
 import { BANNER, NATIVE } from '../src/mediaTypes.js';
-import { getBidIdParameter, deepSetValue, prefixLog } from '../src/utils.js';
+import { getBidIdParameter, deepSetValue, prefixLog, triggerPixel } from '../src/utils.js';
 import { ortbConverter } from '../libraries/ortbConverter/converter.js';
+import * as events from '../src/events.js';
+import { EVENTS } from '../src/constants.js';
 const adgLogger = prefixLog('Adgeneration: ');
 
 /**
@@ -148,6 +150,17 @@ export const spec = {
         advertiserDomains: adResult.adomain
       }
     }
+    const trackers = adResult.trackers || {};
+    const viewableUrls = collectViewableUrls(trackers);
+    const loadUrls = collectLoadUrls(trackers);
+    if (viewableUrls.length > 0) {
+      bidResponse.vurls = viewableUrls;
+      bidResponse._adgViewableUrls = [...viewableUrls];
+    }
+    if (loadUrls.length > 0) {
+      bidResponse._adgLoadUrls = loadUrls;
+    }
+
     if (isNative(adResult)) {
       bidResponse.native = createNativeAd(adResult.native, adResult.beaconurl);
       bidResponse.mediaType = NATIVE;
@@ -168,6 +181,11 @@ export const spec = {
   getUserSyncs: function (syncOptions, serverResponses) {
     const syncs = [];
     return syncs;
+  },
+
+  onBidViewable: function (bid) {
+    adgLogger.logInfo('[debug]Bid viewable', bid);
+    fireViewableUrls(bid);
   }
 };
 
@@ -310,4 +328,75 @@ function getCurrencyType(bidderRequest) {
   return adServerCurrency.toUpperCase() === 'USD' ? 'USD' : 'JPY'
 }
 
+function isAdgBid(bid) {
+  return bid && (bid.bidder === ADG_BIDDER_CODE || bid.bidder === 'adg');
+}
+
+function collectViewableUrls(trackers) {
+  const urls = [];
+  if (Array.isArray(trackers.viewable_imp)) {
+    urls.push(...trackers.viewable_imp);
+  }
+  if (trackers.impcondition && Array.isArray(trackers.imp)) {
+    urls.push(...trackers.imp);
+  }
+  if (Array.isArray(trackers.areatime)) {
+    trackers.areatime.forEach(at => {
+      if (at.url && at.area != null && at.ms != null) {
+        urls.push(at.url);
+      }
+    });
+  }
+  return urls;
+}
+
+function collectLoadUrls(trackers) {
+  const urls = [];
+  if (Array.isArray(trackers.viewable_measured)) {
+    urls.push(...trackers.viewable_measured);
+  }
+  if (Array.isArray(trackers.areatime)) {
+    trackers.areatime.forEach(at => {
+      if (at.url && at.area == null && at.ms == null) {
+        urls.push(at.url);
+      }
+    });
+  }
+  return urls;
+}
+
+function fireViewableUrls(bid) {
+  if (bid._adgViewableFired) return;
+  bid._adgViewableFired = true;
+  const urls = bid._adgViewableUrls || [];
+  urls.forEach(url => triggerPixel(url));
+  if (urls.length > 0) {
+    adgLogger.logInfo('viewable pixels fired', urls);
+  }
+}
+
+function fireLoadUrls(bid) {
+  if (bid._adgLoadFired) return;
+  bid._adgLoadFired = true;
+  const urls = bid._adgLoadUrls || [];
+  urls.forEach(url => triggerPixel(url));
+  if (urls.length > 0) {
+    adgLogger.logInfo('load pixels fired', urls);
+  }
+}
+
 registerBidder(spec);
+
+events.on(EVENTS.BID_VIEWABLE, function (bid) {
+  adgLogger.logInfo('[debug]BID_VIEWABLE event received for bid:', bid);
+  if (isAdgBid(bid)) {
+    fireViewableUrls(bid);
+  }
+});
+
+events.on(EVENTS.AD_RENDER_SUCCEEDED, function ({doc, bid, id}) {
+  adgLogger.logInfo('[debug]AD_RENDER_SUCCEEDED event received for bid:', bid, 'with id:', id);
+  if (isAdgBid(bid)) {
+    fireLoadUrls(bid);
+  }
+});

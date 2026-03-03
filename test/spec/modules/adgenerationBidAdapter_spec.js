@@ -1,10 +1,12 @@
 import {expect} from 'chai';
+import sinon from 'sinon';
 import {spec} from 'modules/adgenerationBidAdapter.js';
 import {newBidder} from 'src/adapters/bidderFactory.js';
 import {NATIVE} from 'src/mediaTypes.js';
 import prebid from 'package.json';
 import { setConfig as setCurrencyConfig } from '../../../modules/currency.js';
 import { addFPDToBidderRequest } from '../../helpers/fpd.js';
+import * as utils from 'src/utils.js';
 
 describe('AdgenerationAdapter', function () {
   const adapter = newBidder(spec);
@@ -1415,6 +1417,232 @@ describe('AdgenerationAdapter', function () {
 
         const result = spec.interpretResponse(serverResponse, bidRequestWithJPY)[0];
         expect(result.currency).to.equal('JPY');
+      });
+    });
+  });
+
+  describe('viewability', function () {
+    const baseBidRequest = {
+      method: 'POST',
+      url: 'https://d.socdm.com/adgen/prebid?id=58278&posall=SSPLOC&sdktype=0',
+      data: {
+        currency: 'JPY',
+        pbver: prebid.version,
+        sdkname: 'prebidjs',
+        adapterver: ADGENE_PREBID_VERSION,
+        ortb: {
+          imp: [{
+            id: 'test-imp-id',
+            ext: {
+              params: { id: '58278' },
+              mediaTypes: { banner: { sizes: [[300, 250]] } }
+            },
+            banner: { topframe: 1, format: [{ w: 300, h: 250 }] }
+          }]
+        }
+      }
+    };
+
+    describe('interpretResponse with trackers', function () {
+      it('should set vurls and _adgViewableUrls from viewable_imp', function () {
+        const serverResponse = {
+          body: {
+            results: [{
+              ad: '<div>Test</div>',
+              beacon: '<img src="http://example.com"/>',
+              cpm: 100,
+              w: 300,
+              h: 250,
+              creativeid: 'crid1',
+              dealid: '',
+              ttl: 10,
+              trackers: {
+                viewable_imp: ['https://track.example.com/viewable1', 'https://track.example.com/viewable2']
+              }
+            }]
+          }
+        };
+        const result = spec.interpretResponse(serverResponse, baseBidRequest)[0];
+        expect(result.vurls).to.deep.equal([
+          'https://track.example.com/viewable1',
+          'https://track.example.com/viewable2'
+        ]);
+        expect(result._adgViewableUrls).to.deep.equal(result.vurls);
+      });
+
+      it('should include imp URLs in vurls when impcondition exists', function () {
+        const serverResponse = {
+          body: {
+            results: [{
+              ad: '<div>Test</div>',
+              beacon: '<img src="http://example.com"/>',
+              cpm: 100,
+              w: 300,
+              h: 250,
+              creativeid: 'crid1',
+              dealid: '',
+              ttl: 10,
+              trackers: {
+                imp: ['https://track.example.com/imp1'],
+                impcondition: { area: 0.5, ms: 1000 }
+              }
+            }]
+          }
+        };
+        const result = spec.interpretResponse(serverResponse, baseBidRequest)[0];
+        expect(result.vurls).to.include('https://track.example.com/imp1');
+      });
+
+      it('should not include imp URLs in vurls when impcondition is absent', function () {
+        const serverResponse = {
+          body: {
+            results: [{
+              ad: '<div>Test</div>',
+              beacon: '<img src="http://example.com"/>',
+              cpm: 100,
+              w: 300,
+              h: 250,
+              creativeid: 'crid1',
+              dealid: '',
+              ttl: 10,
+              trackers: {
+                imp: ['https://track.example.com/imp1']
+              }
+            }]
+          }
+        };
+        const result = spec.interpretResponse(serverResponse, baseBidRequest)[0];
+        expect(result.vurls).to.be.undefined;
+      });
+
+      it('should categorize areatime entries correctly', function () {
+        const serverResponse = {
+          body: {
+            results: [{
+              ad: '<div>Test</div>',
+              beacon: '<img src="http://example.com"/>',
+              cpm: 100,
+              w: 300,
+              h: 250,
+              creativeid: 'crid1',
+              dealid: '',
+              ttl: 10,
+              trackers: {
+                areatime: [
+                  { area: 0.5, ms: 1000, url: 'https://track.example.com/viewable_at' },
+                  { url: 'https://track.example.com/load_at' }
+                ],
+                viewable_measured: ['https://track.example.com/measured']
+              }
+            }]
+          }
+        };
+        const result = spec.interpretResponse(serverResponse, baseBidRequest)[0];
+        expect(result.vurls).to.deep.equal(['https://track.example.com/viewable_at']);
+        expect(result._adgLoadUrls).to.deep.equal([
+          'https://track.example.com/measured',
+          'https://track.example.com/load_at'
+        ]);
+      });
+
+      it('should not set vurls when no trackers exist', function () {
+        const serverResponse = {
+          body: {
+            results: [{
+              ad: '<div>Test</div>',
+              beacon: '<img src="http://example.com"/>',
+              cpm: 100,
+              w: 300,
+              h: 250,
+              creativeid: 'crid1',
+              dealid: '',
+              ttl: 10
+            }]
+          }
+        };
+        const result = spec.interpretResponse(serverResponse, baseBidRequest)[0];
+        expect(result.vurls).to.be.undefined;
+        expect(result._adgViewableUrls).to.be.undefined;
+        expect(result._adgLoadUrls).to.be.undefined;
+      });
+
+      it('should combine all viewable URL sources', function () {
+        const serverResponse = {
+          body: {
+            results: [{
+              ad: '<div>Test</div>',
+              beacon: '<img src="http://example.com"/>',
+              cpm: 100,
+              w: 300,
+              h: 250,
+              creativeid: 'crid1',
+              dealid: '',
+              ttl: 10,
+              trackers: {
+                viewable_imp: ['https://track.example.com/vi1'],
+                imp: ['https://track.example.com/imp1'],
+                impcondition: { area: 0.01, ms: 1000 },
+                areatime: [
+                  { area: 0.5, ms: 2000, url: 'https://track.example.com/at1' }
+                ]
+              }
+            }]
+          }
+        };
+        const result = spec.interpretResponse(serverResponse, baseBidRequest)[0];
+        expect(result.vurls).to.deep.equal([
+          'https://track.example.com/vi1',
+          'https://track.example.com/imp1',
+          'https://track.example.com/at1'
+        ]);
+      });
+    });
+
+    describe('onBidViewable', function () {
+      let triggerPixelStub;
+
+      beforeEach(function () {
+        triggerPixelStub = sinon.stub(utils, 'triggerPixel');
+      });
+
+      afterEach(function () {
+        triggerPixelStub.restore();
+      });
+
+      it('should exist as a function', function () {
+        expect(spec.onBidViewable).to.be.a('function');
+      });
+
+      it('should fire viewable pixels', function () {
+        const bid = {
+          bidder: 'adgeneration',
+          _adgViewableUrls: [
+            'https://track.example.com/viewable1',
+            'https://track.example.com/viewable2'
+          ]
+        };
+        spec.onBidViewable(bid);
+        expect(triggerPixelStub.calledTwice).to.be.true;
+        expect(triggerPixelStub.firstCall.calledWith('https://track.example.com/viewable1')).to.be.true;
+        expect(triggerPixelStub.secondCall.calledWith('https://track.example.com/viewable2')).to.be.true;
+      });
+
+      it('should not fire pixels twice (dedup)', function () {
+        const bid = {
+          bidder: 'adgeneration',
+          _adgViewableUrls: ['https://track.example.com/viewable1']
+        };
+        spec.onBidViewable(bid);
+        spec.onBidViewable(bid);
+        expect(triggerPixelStub.calledOnce).to.be.true;
+      });
+
+      it('should not fire when no viewable URLs exist', function () {
+        const bid = {
+          bidder: 'adgeneration'
+        };
+        spec.onBidViewable(bid);
+        expect(triggerPixelStub.notCalled).to.be.true;
       });
     });
   });
