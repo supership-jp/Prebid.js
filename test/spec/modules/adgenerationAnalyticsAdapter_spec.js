@@ -79,7 +79,12 @@ describe('ADG Analytics Adapter', () => {
   });
 
   afterEach(() => {
-    adgAnalyticsAdapter.disableAnalytics();
+    // enableAnalytics を呼んでいないテストで disableAnalytics すると、基盤側が
+    // enableAnalytics を素の実装へ差し戻し、以降のテストで endpoint ラッパーが失われる。
+    // そのため実際に有効化されたときのみ無効化する。
+    if (adgAnalyticsAdapter.enabled) {
+      adgAnalyticsAdapter.disableAnalytics();
+    }
     sandbox.restore();
   });
 
@@ -110,6 +115,14 @@ describe('ADG Analytics Adapter', () => {
       });
       expect(locals.endpoint).to.equal(DEFAULT_ENDPOINT);
     });
+
+    it('falls back to the default endpoint when the protocol separator is missing', () => {
+      adgAnalyticsAdapter.enableAnalytics({
+        provider: PROVIDER_CODE,
+        options: { endpoint: 'httpfoo' },
+      });
+      expect(locals.endpoint).to.equal(DEFAULT_ENDPOINT);
+    });
   });
 
   describe('auction batching', () => {
@@ -134,8 +147,9 @@ describe('ADG Analytics Adapter', () => {
       expect(report.auctionId).to.equal(AUCTION_ID);
       const bidders = report.adUnits[AD_UNIT_CODE].bidders;
       expect(bidders.adgeneration.status).to.equal('bid');
-      expect(bidders.adgeneration.cpm).to.equal(120.5);
-      expect(bidders.adgeneration.mediaType).to.equal('banner');
+      expect(bidders.adgeneration.bids).to.have.lengthOf(1);
+      expect(bidders.adgeneration.bids[0].cpm).to.equal(120.5);
+      expect(bidders.adgeneration.bids[0].mediaType).to.equal('banner');
       expect(bidders.rubicon.status).to.equal('noBid');
     });
 
@@ -150,6 +164,80 @@ describe('ADG Analytics Adapter', () => {
 
       const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
       expect(report.adUnits[AD_UNIT_CODE].bidders.rubicon.status).to.equal('timeout');
+    });
+
+    it('records timeout status when BID_TIMEOUT args are object-shaped (analyticsLabels)', () => {
+      events.emit(EVENTS.AUCTION_INIT, auctionInit);
+      events.emit(EVENTS.BID_REQUESTED, bidRequested);
+      // analytics 基盤がラベル付与時に配列 args をオブジェクト化した形を再現する。
+      events.emit(EVENTS.BID_TIMEOUT, {
+        analyticsLabels: { publisher: { foo: 'bar' } },
+        0: { auctionId: AUCTION_ID, adUnitCode: AD_UNIT_CODE, bidder: 'rubicon' },
+      });
+      events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
+      clock.tick(101);
+
+      const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
+      expect(report.adUnits[AD_UNIT_CODE].bidders.rubicon.status).to.equal('timeout');
+    });
+
+    it('records rejected status and reason on BID_REJECTED', () => {
+      events.emit(EVENTS.AUCTION_INIT, auctionInit);
+      events.emit(EVENTS.BID_REQUESTED, bidRequested);
+      events.emit(EVENTS.BID_REJECTED, {
+        auctionId: AUCTION_ID,
+        adUnitCode: AD_UNIT_CODE,
+        bidderCode: 'rubicon',
+        cpm: 5,
+        currency: 'JPY',
+        mediaType: 'banner',
+        rejectionReason: 'Bid CPM is 0 or null',
+      });
+      events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
+      clock.tick(101);
+
+      const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
+      const rubicon = report.adUnits[AD_UNIT_CODE].bidders.rubicon;
+      expect(rubicon.status).to.equal('rejected');
+      expect(rubicon.rejectedBids).to.have.lengthOf(1);
+      expect(rubicon.rejectedBids[0].reason).to.equal('Bid CPM is 0 or null');
+      expect(rubicon.rejectedBids[0].cpm).to.equal(5);
+    });
+
+    it('keeps status "bid" even if a later BID_TIMEOUT / BID_REJECTED arrives', () => {
+      events.emit(EVENTS.AUCTION_INIT, auctionInit);
+      events.emit(EVENTS.BID_REQUESTED, bidRequested);
+      events.emit(EVENTS.BID_RESPONSE, bidResponse);
+      events.emit(EVENTS.BID_TIMEOUT, [
+        { auctionId: AUCTION_ID, adUnitCode: AD_UNIT_CODE, bidder: 'adgeneration' },
+      ]);
+      events.emit(EVENTS.BID_REJECTED, {
+        auctionId: AUCTION_ID,
+        adUnitCode: AD_UNIT_CODE,
+        bidderCode: 'adgeneration',
+        rejectionReason: 'too late',
+      });
+      events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
+      clock.tick(101);
+
+      const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
+      expect(report.adUnits[AD_UNIT_CODE].bidders.adgeneration.status).to.equal('bid');
+    });
+
+    it('accumulates multiple BID_RESPONSE for the same bidder', () => {
+      events.emit(EVENTS.AUCTION_INIT, auctionInit);
+      events.emit(EVENTS.BID_REQUESTED, bidRequested);
+      events.emit(EVENTS.BID_RESPONSE, bidResponse);
+      events.emit(EVENTS.BID_RESPONSE, { ...bidResponse, cpm: 80, mediaType: 'video', size: '640x480' });
+      events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
+      clock.tick(101);
+
+      const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
+      const bids = report.adUnits[AD_UNIT_CODE].bidders.adgeneration.bids;
+      expect(bids).to.have.lengthOf(2);
+      expect(bids[0].cpm).to.equal(120.5);
+      expect(bids[1].cpm).to.equal(80);
+      expect(bids[1].mediaType).to.equal('video');
     });
 
     it('clears the auction cache after sending', () => {
@@ -192,14 +280,48 @@ describe('ADG Analytics Adapter', () => {
 
     it('sends an adRenderSucceeded report on AD_RENDER_SUCCEEDED', () => {
       events.emit(EVENTS.AD_RENDER_SUCCEEDED, {
-        adUnitCode: AD_UNIT_CODE,
-        bid: { auctionId: AUCTION_ID, adUnitCode: AD_UNIT_CODE },
+        doc: null,
+        adId: 'ad-1',
+        bid: { auctionId: AUCTION_ID, adUnitCode: AD_UNIT_CODE, adId: 'ad-1' },
       });
       clock.tick(101);
 
       const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
       expect(report.type).to.equal('adRenderSucceeded');
       expect(report.auctionId).to.equal(AUCTION_ID);
+      expect(report.adUnitCode).to.equal(AD_UNIT_CODE);
+      expect(report.adId).to.equal('ad-1');
+    });
+
+    it('sends an adRenderFailed report without a bid (CANNOT_FIND_AD shape)', () => {
+      expect(() => {
+        events.emit(EVENTS.AD_RENDER_FAILED, {
+          reason: 'cannotFindAd',
+          message: "Cannot find ad 'ad-missing'",
+          adId: 'ad-missing',
+        });
+      }).to.not.throw();
+      clock.tick(101);
+
+      const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
+      expect(report.type).to.equal('adRenderFailed');
+      expect(report.reason).to.equal('cannotFindAd');
+      expect(report.message).to.equal("Cannot find ad 'ad-missing'");
+      expect(report.adId).to.equal('ad-missing');
+      expect(report).to.not.have.property('auctionId');
+    });
+
+    it('attaches consent data to follow-up (bidWon) reports', () => {
+      gdprDataHandler.getConsentData.returns({
+        gdprApplies: true,
+        consentString: 'consent-string',
+      });
+      events.emit(EVENTS.BID_WON, bidWon);
+      clock.tick(101);
+
+      const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
+      expect(report.gdpr).to.equal(1);
+      expect(report.gdprConsent).to.equal('consent-string');
     });
   });
 
@@ -221,30 +343,48 @@ describe('ADG Analytics Adapter', () => {
     });
   });
 
-  describe('buildAuctionReport', () => {
-    it('includes GDPR consent data when present', () => {
+  describe('consent data', () => {
+    beforeEach(() => {
+      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: {} });
+    });
+
+    it('includes GDPR consent data in the auction report when present', () => {
       gdprDataHandler.getConsentData.returns({
         gdprApplies: true,
         consentString: 'consent-string',
       });
-      const report = buildAuctionReport({
-        auctionId: AUCTION_ID,
-        timestamp: 1700000000000,
-        adUnits: {},
-      });
+      events.emit(EVENTS.AUCTION_INIT, auctionInit);
+      events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
+      clock.tick(101);
+
+      const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
       expect(report.gdpr).to.equal(1);
       expect(report.gdprConsent).to.equal('consent-string');
     });
 
     it('omits consent fields when no consent data is present', () => {
+      events.emit(EVENTS.AUCTION_INIT, auctionInit);
+      events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
+      clock.tick(101);
+
+      const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
+      expect(report).to.not.have.property('gdpr');
+      expect(report).to.not.have.property('usPrivacy');
+    });
+  });
+
+  describe('buildAuctionReport', () => {
+    it('produces the core report shape without consent data', () => {
       const report = buildAuctionReport({
         auctionId: AUCTION_ID,
         timestamp: 1700000000000,
         adUnits: {},
       });
-      expect(report).to.not.have.property('gdpr');
-      expect(report).to.not.have.property('usPrivacy');
+      expect(report.type).to.equal('auction');
+      expect(report.auctionId).to.equal(AUCTION_ID);
       expect(report.pbjsVersion).to.exist;
+      // 同意情報は send() 層で付与するため、この段階では含まれない。
+      expect(report).to.not.have.property('gdpr');
     });
   });
 });

@@ -14,6 +14,13 @@ type / size / win) and sends it to AdGeneration's analytics endpoint. The data
 is aggregated per auction and sent on `AUCTION_END`, while `BID_WON`,
 `BID_VIEWABLE` and ad render results are sent individually as follow-up events.
 
+Within the auction report, each bidder entry carries a `status` of
+`requested`, `bid`, `noBid`, `timeout` or `rejected`. A successful
+`BID_RESPONSE` always wins over the other statuses. Because a single bidder can
+respond multiple times (multi-format / multibid), successful responses are
+collected in a `bids` array, and rejected responses (with their `reason`) in a
+`rejectedBids` array.
+
 Reports are sent with `navigator.sendBeacon()` so they are not lost even when
 the page is unloaded; if `sendBeacon` is unavailable the adapter falls back to
 an `ajax` POST.

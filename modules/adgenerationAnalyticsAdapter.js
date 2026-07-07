@@ -7,7 +7,6 @@ import { getRefererInfo } from '../src/refererDetection.js';
 
 const PROVIDER_CODE = 'adgeneration';
 const ANALYTICS_VERSION = '1.0.0';
-const GVLID = undefined; // ADG の GDPR Vendor List ID。GDPR 対応時に設定する
 const DEFAULT_ENDPOINT = 'https://d.socdm.com/adgen/analytics';
 
 const {
@@ -16,6 +15,7 @@ const {
   BID_RESPONSE,
   NO_BID,
   BID_TIMEOUT,
+  BID_REJECTED,
   AUCTION_END,
   BID_WON,
   AD_RENDER_SUCCEEDED,
@@ -39,6 +39,23 @@ export const locals = {
     this.auctions = {};
   },
 };
+
+/**
+ * BID_RESPONSE / BID_REJECTED / BID_WON で共通して bid から抜き出すフィールド。
+ */
+function pickBidFields(bid) {
+  return {
+    cpm: bid.cpm,
+    currency: bid.currency,
+    originalCpm: bid.originalCpm,
+    originalCurrency: bid.originalCurrency,
+    timeToRespond: bid.timeToRespond,
+    mediaType: bid.mediaType,
+    size: bid.size,
+    creativeId: bid.creativeId,
+    dealId: bid.dealId,
+  };
+}
 
 /**
  * 指定 adUnit の bidder 集計エントリを取得（無ければ生成）する。
@@ -70,29 +87,35 @@ function onBidRequested({ auctionId, bids = [] }) {
 function onBidResponse(bid) {
   const entry = getBidderEntry(bid.auctionId, bid.adUnitCode, bid.bidderCode);
   if (!entry) return;
-  Object.assign(entry, {
-    status: 'bid',
-    cpm: bid.cpm,
-    currency: bid.currency,
-    originalCpm: bid.originalCpm,
-    originalCurrency: bid.originalCurrency,
-    timeToRespond: bid.timeToRespond,
-    mediaType: bid.mediaType,
-    size: bid.size,
-    creativeId: bid.creativeId,
-    dealId: bid.dealId,
-  });
+  // BID_RESPONSE は他ステータスに優先して常に 'bid' とする。
+  entry.status = 'bid';
+  // マルチフォーマット / multibid で同一 bidder から複数応答が来るため配列に積む。
+  (entry.bids = entry.bids || []).push(pickBidFields(bid));
 }
 
 function onNoBid({ auctionId, adUnitCode, bidder }) {
   const entry = getBidderEntry(auctionId, adUnitCode, bidder);
-  if (entry) entry.status = 'noBid';
+  if (entry && entry.status !== 'bid') entry.status = 'noBid';
 }
 
-function onBidTimeout(args = []) {
-  args.forEach(({ auctionId, adUnitCode, bidder }) => {
+function onBidTimeout(args) {
+  // analytics 基盤はラベル付与時に配列 args をオブジェクト化する（{analyticsLabels, 0: bid, 1: bid}）ため両形に対応する。
+  const bids = Array.isArray(args)
+    ? args
+    : Object.keys(args || {}).filter((k) => k !== 'analyticsLabels').map((k) => args[k]);
+  bids.forEach(({ auctionId, adUnitCode, bidder }) => {
     const entry = getBidderEntry(auctionId, adUnitCode, bidder);
-    if (entry) entry.status = 'timeout';
+    if (entry && entry.status !== 'bid') entry.status = 'timeout';
+  });
+}
+
+function onBidRejected(bid) {
+  const entry = getBidderEntry(bid.auctionId, bid.adUnitCode, bid.bidderCode || bid.bidder);
+  if (!entry) return;
+  if (entry.status !== 'bid') entry.status = 'rejected';
+  (entry.rejectedBids = entry.rejectedBids || []).push({
+    ...pickBidFields(bid),
+    reason: bid.rejectionReason,
   });
 }
 
@@ -109,20 +132,19 @@ function onBidWon(bid) {
     auctionId: bid.auctionId,
     adUnitCode: bid.adUnitCode,
     bidder: bid.bidderCode,
-    cpm: bid.cpm,
-    currency: bid.currency,
-    mediaType: bid.mediaType,
-    size: bid.size,
-    creativeId: bid.creativeId,
-    dealId: bid.dealId,
+    ...pickBidFields(bid),
   });
 }
 
 function onAdRender(eventType, args) {
+  const bid = args.bid;
   send({
-    type: eventType === AD_RENDER_SUCCEEDED ? 'adRenderSucceeded' : 'adRenderFailed',
-    auctionId: args.bid && args.bid.auctionId,
-    adUnitCode: args.adUnitCode || (args.bid && args.bid.adUnitCode),
+    type: eventType, // 定数値が 'adRenderSucceeded' / 'adRenderFailed' そのものなので変換不要
+    auctionId: bid && bid.auctionId,
+    adUnitCode: bid && bid.adUnitCode,
+    adId: args.adId || (bid && bid.adId),
+    reason: args.reason, // FAILED のみ存在（undefined は JSON.stringify で落ちる）
+    message: args.message, // 同上
   });
 }
 
@@ -137,7 +159,7 @@ function onBidViewable(bid) {
 }
 
 /**
- * オークション集約データを送信用レポートに整形し、同意情報を同梱する。
+ * オークション集約データを送信用レポートに整形する。同意情報は send() で付与する。
  * テストから検証できるよう export する。
  */
 export function buildAuctionReport(auction) {
@@ -150,7 +172,7 @@ export function buildAuctionReport(auction) {
     timestamp: auction.timestamp,
     adUnits: auction.adUnits,
   };
-  return addConsentData(report);
+  return report;
 }
 
 /**
@@ -179,10 +201,11 @@ function addConsentData(report) {
 
 /**
  * ページ遷移後も欠損しにくい sendBeacon を優先し、利用不可なら ajax にフォールバックする。
+ * 同意情報はここで付与し、集約送信・後追い送信の双方で確実に同梱されるようにする。
  * Content-Type は preflight(OPTIONS) を避けるため text/plain とする（サーバー側で JSON パースする）。
  */
 function send(payload) {
-  const body = JSON.stringify(payload);
+  const body = JSON.stringify(addConsentData(payload));
   if (sendBeacon(locals.endpoint, body)) {
     logInfo(`${LOG_PREFIX}report sent`, payload);
     return;
@@ -211,6 +234,9 @@ function handleEvent({ eventType, args }) {
     case BID_TIMEOUT:
       onBidTimeout(args);
       break;
+    case BID_REJECTED:
+      onBidRejected(args);
+      break;
     case AUCTION_END:
       onAuctionEnd(args);
       break;
@@ -229,6 +255,18 @@ function handleEvent({ eventType, args }) {
   }
 }
 
+/**
+ * endpoint が http(s) の絶対 URL かどうかを検証する。
+ */
+function isValidEndpoint(value) {
+  if (typeof value !== 'string') return false;
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol);
+  } catch (e) {
+    return false;
+  }
+}
+
 const adgAnalytics = Object.assign(adapter({ analyticsType: 'endpoint' }), {
   track: handleEvent,
 });
@@ -236,7 +274,7 @@ const adgAnalytics = Object.assign(adapter({ analyticsType: 'endpoint' }), {
 adgAnalytics.originEnableAnalytics = adgAnalytics.enableAnalytics;
 adgAnalytics.enableAnalytics = function (config) {
   const options = (config && config.options) || {};
-  if (options.endpoint && typeof options.endpoint === 'string' && options.endpoint.startsWith('http')) {
+  if (isValidEndpoint(options.endpoint)) {
     locals.endpoint = options.endpoint;
   } else {
     if (options.endpoint) {
@@ -257,7 +295,7 @@ adgAnalytics.disableAnalytics = function () {
 adapterManager.registerAnalyticsAdapter({
   adapter: adgAnalytics,
   code: PROVIDER_CODE,
-  gvlid: GVLID,
+  // GDPR 対応時に gvlid を設定する
 });
 
 export default adgAnalytics;
