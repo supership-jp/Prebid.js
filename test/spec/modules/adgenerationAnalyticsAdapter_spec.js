@@ -19,6 +19,7 @@ const CUSTOM_ENDPOINT = 'https://api-test.scaleout.jp/adgen/analytics';
 
 const AUCTION_ID = 'test-auction-id';
 const AD_UNIT_CODE = 'div-gpt-ad-1';
+const AD_ID = 'test-ad-id-1';
 
 const auctionInit = {
   auctionId: AUCTION_ID,
@@ -37,6 +38,7 @@ const bidResponse = {
   auctionId: AUCTION_ID,
   adUnitCode: AD_UNIT_CODE,
   bidderCode: 'adgeneration',
+  adId: AD_ID,
   cpm: 120.5,
   currency: 'JPY',
   originalCpm: 120.5,
@@ -52,6 +54,7 @@ const bidWon = {
   auctionId: AUCTION_ID,
   adUnitCode: AD_UNIT_CODE,
   bidderCode: 'adgeneration',
+  adId: AD_ID,
   cpm: 120.5,
   currency: 'JPY',
   mediaType: 'banner',
@@ -79,12 +82,11 @@ describe('ADG Analytics Adapter', () => {
   });
 
   afterEach(() => {
-    // enableAnalytics を呼んでいないテストで disableAnalytics すると、基盤側が
-    // enableAnalytics を素の実装へ差し戻し、以降のテストで endpoint ラッパーが失われる。
-    // そのため実際に有効化されたときのみ無効化する。
-    if (adgAnalyticsAdapter.enabled) {
-      adgAnalyticsAdapter.disableAnalytics();
-    }
+    // disableAnalytics は _oldEnable にカスタム enable ラッパーを戻すため、
+    // 未有効化の状態で呼んでも以降のテストでラッパーが失われることはない。
+    adgAnalyticsAdapter.disableAnalytics();
+    // disableAnalytics は replay 整合のため auctions を保持するので、分離はここで明示的に行う。
+    locals.reset();
     sandbox.restore();
   });
 
@@ -148,6 +150,7 @@ describe('ADG Analytics Adapter', () => {
       const bidders = report.adUnits[AD_UNIT_CODE].bidders;
       expect(bidders.adgeneration.status).to.equal('bid');
       expect(bidders.adgeneration.bids).to.have.lengthOf(1);
+      expect(bidders.adgeneration.bids[0].adId).to.equal(AD_ID);
       expect(bidders.adgeneration.bids[0].cpm).to.equal(120.5);
       expect(bidders.adgeneration.bids[0].mediaType).to.equal('banner');
       expect(bidders.rubicon.status).to.equal('noBid');
@@ -262,6 +265,8 @@ describe('ADG Analytics Adapter', () => {
       expect(report.type).to.equal('bidWon');
       expect(report.bidder).to.equal('adgeneration');
       expect(report.cpm).to.equal(120.5);
+      // adId は auction レポートの bids[] と bidWon を突合するためのキー。
+      expect(report.adId).to.equal(AD_ID);
     });
 
     it('sends a viewable report on BID_VIEWABLE', () => {
@@ -370,6 +375,51 @@ describe('ADG Analytics Adapter', () => {
       const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
       expect(report).to.not.have.property('gdpr');
       expect(report).to.not.have.property('usPrivacy');
+    });
+  });
+
+  describe('disable / enable cycle', () => {
+    it('keeps in-flight auction data across a disable / enable cycle', () => {
+      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: {} });
+      events.emit(EVENTS.AUCTION_INIT, auctionInit);
+      events.emit(EVENTS.BID_REQUESTED, bidRequested);
+      events.emit(EVENTS.BID_RESPONSE, bidResponse);
+      clock.tick(101);
+
+      // consent 変化時に adapterManager.refreshAnalytics が行う disable→enable を再現する。
+      adgAnalyticsAdapter.disableAnalytics();
+      expect(locals.auctions[AUCTION_ID]).to.exist;
+      expect(locals.auctions[AUCTION_ID].adUnits[AD_UNIT_CODE].bidders.adgeneration.bids)
+        .to.have.lengthOf(1);
+
+      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: {} });
+      events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
+      clock.tick(101);
+
+      expect(sendBeaconStub.calledOnce).to.be.true;
+      const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
+      expect(report.type).to.equal('auction');
+      expect(report.auctionId).to.equal(AUCTION_ID);
+      const bidders = report.adUnits[AD_UNIT_CODE].bidders;
+      // disable 前に track した BID_RESPONSE がレポートに残っていること。
+      expect(bidders.adgeneration.status).to.equal('bid');
+      expect(bidders.adgeneration.bids).to.have.lengthOf(1);
+      expect(bidders.adgeneration.bids[0].adId).to.equal(AD_ID);
+      expect(bidders.rubicon.status).to.equal('requested');
+    });
+
+    it('keeps the custom enable wrapper after a disable', () => {
+      adgAnalyticsAdapter.enableAnalytics({
+        provider: PROVIDER_CODE,
+        options: { endpoint: CUSTOM_ENDPOINT },
+      });
+      adgAnalyticsAdapter.disableAnalytics();
+      // disable 直後に flush される pending イベントを正しい宛先へ送るため endpoint は保持される。
+      expect(locals.endpoint).to.equal(CUSTOM_ENDPOINT);
+
+      // ラッパーが失われていなければ、再 enable で endpoint が再設定される。
+      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: {} });
+      expect(locals.endpoint).to.equal(DEFAULT_ENDPOINT);
     });
   });
 

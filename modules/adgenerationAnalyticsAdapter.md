@@ -25,6 +25,17 @@ Reports are sent with `navigator.sendBeacon()` so they are not lost even when
 the page is unloaded; if `sendBeacon` is unavailable the adapter falls back to
 an `ajax` POST.
 
+#### Known limitations
+
+- The auction report is a snapshot taken at `AUCTION_END`. Bid responses that
+  arrive after `AUCTION_END` are not included, because the core still emits
+  `BID_RESPONSE` for late responses that come in after the auction timeout.
+  Such bidders are reported with the status `timeout`.
+- Payloads larger than 64KB cannot be sent with `navigator.sendBeacon`, and the
+  `ajax` fallback loses `keepalive`. A very large report (roughly 250+ bid
+  entries) may therefore be lost if the page is unloaded right after
+  `AUCTION_END`.
+
 #### Viewability
 
 The `BID_VIEWABLE` event is not emitted by the analytics adapter on its own. To
