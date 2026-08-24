@@ -42,9 +42,11 @@ export const locals = {
 
 /**
  * BID_RESPONSE / BID_REJECTED / BID_WON で共通して bid から抜き出すフィールド。
+ * adId は multibid 時に bids[] と bidWon を突合するための一意キー（BID_REJECTED では存在しないことがある）。
  */
 function pickBidFields(bid) {
   return {
+    adId: bid.adId,
     cpm: bid.cpm,
     currency: bid.currency,
     originalCpm: bid.originalCpm,
@@ -271,8 +273,7 @@ const adgAnalytics = Object.assign(adapter({ analyticsType: 'endpoint' }), {
   track: handleEvent,
 });
 
-adgAnalytics.originEnableAnalytics = adgAnalytics.enableAnalytics;
-adgAnalytics.enableAnalytics = function (config) {
+function enableAnalyticsWrapper(config) {
   const options = (config && config.options) || {};
   if (isValidEndpoint(options.endpoint)) {
     locals.endpoint = options.endpoint;
@@ -284,11 +285,19 @@ adgAnalytics.enableAnalytics = function (config) {
   }
   logInfo(`${LOG_PREFIX}enabled`, config);
   adgAnalytics.originEnableAnalytics(config);
-};
+}
+
+adgAnalytics.originEnableAnalytics = adgAnalytics.enableAnalytics;
+adgAnalytics.enableAnalytics = enableAnalyticsWrapper;
 
 adgAnalytics.originDisableAnalytics = adgAnalytics.disableAnalytics;
 adgAnalytics.disableAnalytics = function () {
-  locals.reset();
+  // 基盤の disable は enableAnalytics を素の実装へ差し戻すため、このラッパーを _oldEnable に戻して恒久的な喪失を防ぐ。
+  adgAnalytics._oldEnable = enableAnalyticsWrapper;
+  // consent 変化時の disable→enable では、基盤の replay が flush 済みウォーターマークより後のイベントしか再送しない。
+  // 進行中オークションの track 済みイベント（AUCTION_INIT 等）は再構築できないため locals.auctions は保持する。
+  // endpoint も保持する（基盤の debounce queue は disable でクリアされないため、直後に flush される
+  // pending イベントを正しい宛先へ送る。次の enable で必ず再設定される）。
   adgAnalytics.originDisableAnalytics();
 };
 
