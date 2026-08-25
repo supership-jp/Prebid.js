@@ -155,6 +155,7 @@ function onBidViewable(bid) {
     type: 'viewable',
     auctionId: bid.auctionId,
     adUnitCode: bid.adUnitCode,
+    adId: bid.adId, // bids[] / bidWon と突合するためのキー
     bidder: bid.bidderCode,
     mediaType: bid.mediaType,
   });

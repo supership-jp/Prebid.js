@@ -273,6 +273,7 @@ describe('ADG Analytics Adapter', () => {
       events.emit(EVENTS.BID_VIEWABLE, {
         auctionId: AUCTION_ID,
         adUnitCode: AD_UNIT_CODE,
+        adId: AD_ID,
         bidderCode: 'adgeneration',
         mediaType: 'banner',
       });
@@ -281,6 +282,7 @@ describe('ADG Analytics Adapter', () => {
       const report = JSON.parse(sendBeaconStub.getCall(0).args[1]);
       expect(report.type).to.equal('viewable');
       expect(report.adUnitCode).to.equal(AD_UNIT_CODE);
+      expect(report.adId).to.equal(AD_ID);
     });
 
     it('sends an adRenderSucceeded report on AD_RENDER_SUCCEEDED', () => {
