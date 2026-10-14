@@ -85,21 +85,33 @@ describe('ortb -> ortb native response', () => {
         const bidResponse = {
           mediaType: NATIVE
         };
-        fillNativeResponse(bidResponse, bid, {});
+        fillNativeResponse(bidResponse, bid);
         expect(bidResponse.native).to.eql({ ortb: MOCK_NATIVE_RESPONSE });
       });
     });
     it('should throw if response has no assets', () => {
-      expect(() => fillNativeResponse({ mediaType: NATIVE }, { adm: { ...MOCK_NATIVE_RESPONSE, assets: null } }, {})).to.throw;
+      expect(() => fillNativeResponse({ mediaType: NATIVE }, { adm: { ...MOCK_NATIVE_RESPONSE, assets: null } })).to.throw;
     });
     it('should do nothing if bidResponse.mediaType is not NATIVE', () => {
       const bidResponse = {
         mediaType: BANNER
       };
-      fillNativeResponse(bidResponse, { adm: MOCK_NATIVE_RESPONSE }, {});
+      fillNativeResponse(bidResponse, { adm: MOCK_NATIVE_RESPONSE });
       expect(bidResponse).to.eql({
         mediaType: BANNER
       });
     });
+  });
+  it('should strip polluting keys from a serialized adm', () => {
+    // `adm` crosses the response body as a string, so the guard applied to that body cannot see
+    // inside it. This is a second parse of the same untrusted source.
+    const hostile = JSON.stringify({ ...MOCK_NATIVE_RESPONSE, constructor: { keys: 'pwned' } })
+      .replace(/^\{/, '{"__proto__":{"polluted":true},');
+    const bidResponse = { mediaType: NATIVE };
+
+    fillNativeResponse(bidResponse, { adm: hostile });
+
+    expect(Object.keys(bidResponse.native.ortb)).to.eql(Object.keys(MOCK_NATIVE_RESPONSE));
+    expect(Object.prototype.hasOwnProperty.call(bidResponse.native.ortb, '__proto__')).to.equal(false);
   });
 });

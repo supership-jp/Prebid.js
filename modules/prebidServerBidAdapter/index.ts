@@ -26,6 +26,8 @@ import * as events from '../../src/events.js';
 import { ajax } from '../../src/ajax.js';
 import { hook } from '../../src/hook.js';
 import { hasPurpose1Consent } from '../../src/utils/gdpr.js';
+import { parseUntrustedJSON } from '../../src/utils/untrustedJson.js';
+import { hasVendorPurposeConsent } from '../../libraries/consentManagement/consentUtils.js';
 import { buildPBSRequest, interpretPBSResponse } from './ortbConverter.js';
 import { useMetrics } from '../../src/utils/perfMetrics.js';
 import { isActivityAllowed } from '../../src/activities/rules.js';
@@ -99,6 +101,10 @@ type S2SConfig = {
    * Defines the cookie_sync endpoint for the Prebid Server cluster.
    */
   syncEndpoint: Endpoint;
+  /**
+   * GVL ID of the Prebid Server host. When set, endpoint URL selection uses TCF purpose 1 validation for this vendor instead of generic purpose 1 consent.
+   */
+  hostGvlid?: string;
   /**
    * Max number of userSync URLs that can be executed by Prebid Server cookie_sync per request.
    * If not defined, PBS will execute all userSync URLs included in the request.
@@ -319,10 +325,10 @@ function queueSync(bidderCodes, gdprConsent, uspConsent, gppConsent, s2sConfig: 
   }
 
   const jsonPayload = JSON.stringify(payload);
-  ajax(getMatchingConsentUrl(s2sConfig.syncEndpoint, gdprConsent),
+  ajax(getMatchingConsentUrl(s2sConfig.syncEndpoint, gdprConsent, s2sConfig.hostGvlid),
     (response) => {
       try {
-        const responseJson = JSON.parse(response);
+        const responseJson = parseUntrustedJSON(response);
         doAllSyncs(responseJson.bidder_status, s2sConfig);
       } catch (e) {
         logError(e);
@@ -416,8 +422,10 @@ function doClientSideSyncs(bidders, gdprConsent, uspConsent, gppConsent) {
   });
 }
 
-function getMatchingConsentUrl(urlProp, gdprConsent) {
-  const hasPurpose = hasPurpose1Consent(gdprConsent);
+function getMatchingConsentUrl(urlProp, gdprConsent, hostGvlid?: string) {
+  const hasPurpose = hostGvlid
+    ? hasVendorPurposeConsent(gdprConsent, 1, hostGvlid)
+    : hasPurpose1Consent(gdprConsent);
   const url = hasPurpose ? urlProp.p1Consent : urlProp.noP1Consent;
   if (!url) {
     logWarn('Missing matching consent URL when gdpr=' + hasPurpose);
@@ -486,7 +494,7 @@ export function PrebidServer() {
     const { gdprConsent, uspConsent, gppConsent } = getConsentData(bidRequests);
 
     if (Array.isArray(_s2sConfigs)) {
-      if (s2sBidRequest.s2sConfig && s2sBidRequest.s2sConfig.syncEndpoint && getMatchingConsentUrl(s2sBidRequest.s2sConfig.syncEndpoint, gdprConsent)) {
+      if (s2sBidRequest.s2sConfig && s2sBidRequest.s2sConfig.syncEndpoint && getMatchingConsentUrl(s2sBidRequest.s2sConfig.syncEndpoint, gdprConsent, s2sBidRequest.s2sConfig.hostGvlid)) {
         const s2sAliases = (s2sBidRequest.s2sConfig.extPrebid && s2sBidRequest.s2sConfig.extPrebid.aliases) ?? {};
         const syncBidders = s2sBidRequest.s2sConfig.bidders
           .map(bidder => adapterManager.aliasRegistry[bidder] || s2sAliases[bidder] || bidder)
@@ -579,7 +587,7 @@ export const processPBSRequest = hook('async', function (s2sBidRequest, bidReque
 
   const request = s2sBidRequest.metrics.measureTime('buildRequests', () => buildPBSRequest(s2sBidRequest, bidRequests, adUnits, requestedBidders));
   const requestData: PbsRequestData = {
-    endpointUrl: getMatchingConsentUrl(s2sBidRequest.s2sConfig.endpoint, gdprConsent),
+    endpointUrl: getMatchingConsentUrl(s2sBidRequest.s2sConfig.endpoint, gdprConsent, s2sBidRequest.s2sConfig.hostGvlid),
     requestJson: request && JSON.stringify(request),
     customHeaders: s2sBidRequest?.s2sConfig?.customHeaders ?? {},
   };
@@ -595,7 +603,7 @@ export const processPBSRequest = hook('async', function (s2sBidRequest, bidReque
             networkDone();
             let result;
             try {
-              result = JSON.parse(response);
+              result = parseUntrustedJSON(response);
               const { bids } = s2sBidRequest.metrics.measureTime('interpretResponse', () => interpretPBSResponse(result, request));
               bids.forEach(onBid);
             } catch (error) {
@@ -629,14 +637,23 @@ export const processPBSRequest = hook('async', function (s2sBidRequest, bidReque
       logWarn('Skipping GZIP compression for PBS as debug mode is enabled');
     }
 
-    if (enableGZipCompression && !debugMode && isGzipCompressionSupported()) {
-      compressDataWithGZip(requestData.requestJson).then(compressedPayload => {
-        const url = new URL(requestData.endpointUrl);
-        url.searchParams.set('gzip', '1');
-        callAjax(compressedPayload, url.href);
-      });
+    const sendUncompressed = () => callAjax(requestData.requestJson, requestData.endpointUrl);
+
+    if (enableGZipCompression && !debugMode) {
+      isGzipCompressionSupported().then((supported) => {
+        if (supported) {
+          return compressDataWithGZip(requestData.requestJson)
+            .then(compressedPayload => {
+              const url = new URL(requestData.endpointUrl);
+              url.searchParams.set('gzip', '1');
+              callAjax(compressedPayload, url.href);
+            });
+        } else {
+          sendUncompressed();
+        }
+      }).catch(sendUncompressed);
     } else {
-      callAjax(requestData.requestJson, requestData.endpointUrl);
+      sendUncompressed();
     }
   } else {
     logError('PBS request not made.  Check endpoints.');
