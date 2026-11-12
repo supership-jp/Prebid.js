@@ -8,7 +8,7 @@ import { addFPDToBidderRequest } from '../../helpers/fpd.js';
 
 describe('AdgenerationAdapter', function () {
   const adapter = newBidder(spec);
-  const ADGENE_PREBID_VERSION = '1.7.0';
+  const ADGENE_PREBID_VERSION = '1.10.0';
   const ENDPOINT_STG = 'https://api-test.scaleout.jp/adgen/prebid';
   const ENDPOINT_RELEASE = 'https://d.socdm.com/adgen/prebid';
 
@@ -968,6 +968,7 @@ describe('AdgenerationAdapter', function () {
             {
               ad: '<div></div>',
               beacon: '<img src="http://example.com" width="1" height="1" style="display:none;border:none;padding:0;margin:0;width:1px;height:1px"/>',
+              beaconurl: 'https://example.com/bc',
               cpm: 36.0008,
               ids: {},
               adomain: ['advertiserdomain.com'],
@@ -1040,6 +1041,7 @@ describe('AdgenerationAdapter', function () {
                     required: 0
                   }
                 ],
+                privacy: 'https://example.com/optout/#',
                 imptrackers: ['https://example.com/1x1.gif'],
                 link: {
                   clicktrackers: [
@@ -1142,26 +1144,6 @@ describe('AdgenerationAdapter', function () {
           ttl: 1000,
           adomain: ['advertiserdomain.com'],
           ad: '<div></div>',
-          native: {
-            title: 'Title',
-            image: {
-              url: 'https://example.com/adg-sample-ad/img/300x250.png',
-              height: 250,
-              width: 300
-            },
-            icon: {
-              url: 'https://example.com/300x300.png',
-              height: 300,
-              width: 300
-            },
-            sponsoredBy: 'Sponsored',
-            body: 'Description',
-            cta: 'CTA',
-            privacyLink: 'https://example.com/optout/#',
-            clickUrl: 'https://example.com',
-            clickTrackers: ['https://example.com/1x1_clicktracker_access.gif'],
-            impressionTrackers: ['https://example.com/1x1.gif']
-          },
           mediaType: NATIVE
         },
         upperBillboard: {
@@ -1239,20 +1221,11 @@ describe('AdgenerationAdapter', function () {
       expect(result.currency).to.equal(bidResponses.normal.native.currency);
       expect(result.netRevenue).to.equal(bidResponses.normal.native.netRevenue);
       expect(result.ttl).to.equal(bidResponses.normal.native.ttl);
-      expect(result.native.title).to.equal(bidResponses.normal.native.native.title);
-      expect(result.native.image.url).to.equal(bidResponses.normal.native.native.image.url);
-      expect(result.native.image.height).to.equal(bidResponses.normal.native.native.image.height);
-      expect(result.native.image.width).to.equal(bidResponses.normal.native.native.image.width);
-      expect(result.native.icon.url).to.equal(bidResponses.normal.native.native.icon.url);
-      expect(result.native.icon.width).to.equal(bidResponses.normal.native.native.icon.width);
-      expect(result.native.icon.height).to.equal(bidResponses.normal.native.native.icon.height);
-      expect(result.native.sponsoredBy).to.equal(bidResponses.normal.native.native.sponsoredBy);
-      expect(result.native.body).to.equal(bidResponses.normal.native.native.body);
-      expect(result.native.cta).to.equal(bidResponses.normal.native.native.cta);
-      expect(result.native.privacyLink).to.equal(bidResponses.normal.native.native.privacyLink);
-      expect(result.native.clickUrl).to.equal(bidResponses.normal.native.native.clickUrl);
-      expect(result.native.impressionTrackers[0]).to.equal(bidResponses.normal.native.native.impressionTrackers[0]);
-      expect(result.native.clickTrackers[0]).to.equal(bidResponses.normal.native.native.clickTrackers[0]);
+      expect(result.native).to.have.all.keys('ortb');
+      expect(result.native.ortb.assets).to.deep.equal(serverResponse.normal.native.results[0].native.assets);
+      expect(result.native.ortb.link).to.deep.equal(serverResponse.normal.native.results[0].native.link);
+      expect(result.native.ortb.imptrackers).to.deep.equal(['https://example.com/1x1.gif']);
+      expect(result.native.ortb.eventtrackers).to.deep.equal([{ event: 1, method: 1, url: 'https://example.com/bc' }]);
       expect(result.mediaType).to.equal(bidResponses.normal.native.mediaType);
       // no adomain
       expect(result).to.not.have.any.keys('meta');
@@ -1286,32 +1259,77 @@ describe('AdgenerationAdapter', function () {
       expect(result.currency).to.equal(bidResponses.normal.native.currency);
       expect(result.netRevenue).to.equal(bidResponses.normal.native.netRevenue);
       expect(result.ttl).to.equal(bidResponses.normal.native.ttl);
-      expect(result.native.title).to.equal(bidResponses.normal.native.native.title);
-      expect(result.native.image.url).to.equal(bidResponses.normal.native.native.image.url);
-      expect(result.native.image.height).to.equal(bidResponses.normal.native.native.image.height);
-      expect(result.native.image.width).to.equal(bidResponses.normal.native.native.image.width);
-      expect(result.native.icon.url).to.equal(bidResponses.normal.native.native.icon.url);
-      expect(result.native.icon.width).to.equal(bidResponses.normal.native.native.icon.width);
-      expect(result.native.icon.height).to.equal(bidResponses.normal.native.native.icon.height);
-      expect(result.native.sponsoredBy).to.equal(bidResponses.normal.native.native.sponsoredBy);
-      expect(result.native.body).to.equal(bidResponses.normal.native.native.body);
-      expect(result.native.cta).to.equal(bidResponses.normal.native.native.cta);
-      expect(result.native.privacyLink).to.equal(bidResponses.normal.native.native.privacyLink);
-      expect(result.native.clickUrl).to.equal(bidResponses.normal.native.native.clickUrl);
-      expect(result.native.impressionTrackers[0]).to.equal(bidResponses.normal.native.native.impressionTrackers[0]);
-      expect(result.native.clickTrackers[0]).to.equal(bidResponses.normal.native.native.clickTrackers[0]);
+      expect(result.native).to.have.all.keys('ortb');
+      expect(result.native.ortb.assets).to.deep.equal(serverResponse.normal.native.results[0].native.assets);
+      expect(result.native.ortb.link).to.deep.equal(serverResponse.normal.native.results[0].native.link);
+      expect(result.native.ortb.imptrackers).to.deep.equal(['https://example.com/1x1.gif']);
+      expect(result.native.ortb.eventtrackers).to.deep.equal([{ event: 1, method: 1, url: 'https://example.com/bc' }]);
       expect(result.mediaType).to.equal(bidResponses.normal.native.mediaType);
       // no adomain
       expect(result).to.not.have.any.keys('meta');
       expect(result).to.not.have.any.keys('advertiserDomains');
     });
 
-    it('returns privacyLink as-is without URL-encoding', function () {
+    it('passes privacy as-is without URL-encoding', function () {
       const optoutUrl = 'https://example.com/optout/?a=1&b=2#top';
       const body = JSON.parse(JSON.stringify(serverResponse.normal.native));
-      body.results[0].native.assets.find(asset => asset.id === 502).data.value = optoutUrl;
+      body.results[0].native.privacy = optoutUrl;
       const result = spec.interpretResponse({ body }, bidRequests.native)[0];
-      expect(result.native.privacyLink).to.equal(optoutUrl);
+      expect(result.native.ortb.privacy).to.equal(optoutUrl);
+    });
+
+    describe('ADG impression beacon (beaconurl) for native', function () {
+      const beaconUrl = 'https://example.com/bc';
+      const nativeBody = (modify) => {
+        const body = JSON.parse(JSON.stringify(serverResponse.normal.native));
+        if (modify) modify(body.results[0]);
+        return body;
+      };
+      const beaconTrackers = (result) =>
+        (result.native.ortb.eventtrackers || []).filter(t => t.url === beaconUrl);
+
+      it('adds beaconurl as an impression/img event tracker when native does not have it', function () {
+        const result = spec.interpretResponse({ body: nativeBody() }, bidRequests.native)[0];
+        expect(beaconTrackers(result)).to.deep.equal([{ event: 1, method: 1, url: beaconUrl }]);
+      });
+
+      it('keeps the event trackers returned by the server', function () {
+        const omTracker = { event: 555, method: 2, url: 'https://example.com/om.js' };
+        const body = nativeBody(r => { r.native.eventtrackers = [omTracker]; });
+        const result = spec.interpretResponse({ body }, bidRequests.native)[0];
+        expect(result.native.ortb.eventtrackers).to.deep.equal([omTracker, { event: 1, method: 1, url: beaconUrl }]);
+      });
+
+      it('does not add beaconurl when it is already in imptrackers', function () {
+        const body = nativeBody(r => { r.native.imptrackers.push(beaconUrl); });
+        const result = spec.interpretResponse({ body }, bidRequests.native)[0];
+        expect(beaconTrackers(result)).to.have.lengthOf(0);
+        expect(result.native.ortb.imptrackers.filter(url => url === beaconUrl)).to.have.lengthOf(1);
+      });
+
+      it('does not add beaconurl when it is already an impression event tracker', function () {
+        const body = nativeBody(r => { r.native.eventtrackers = [{ event: 1, method: 1, url: beaconUrl }]; });
+        const result = spec.interpretResponse({ body }, bidRequests.native)[0];
+        expect(beaconTrackers(result)).to.have.lengthOf(1);
+      });
+
+      it('adds beaconurl when the same URL is only in a non-impression event tracker', function () {
+        const body = nativeBody(r => { r.native.eventtrackers = [{ event: 2, method: 1, url: beaconUrl }]; });
+        const result = spec.interpretResponse({ body }, bidRequests.native)[0];
+        expect(beaconTrackers(result).filter(t => t.event === 1)).to.have.lengthOf(1);
+      });
+
+      it('does not add an event tracker when beaconurl is missing', function () {
+        const body = nativeBody(r => { delete r.beaconurl; });
+        const result = spec.interpretResponse({ body }, bidRequests.native)[0];
+        expect(result.native.ortb).to.not.have.property('eventtrackers');
+      });
+
+      it('does not modify the server response', function () {
+        const body = nativeBody();
+        spec.interpretResponse({ body }, bidRequests.native);
+        expect(body.results[0].native).to.not.have.property('eventtrackers');
+      });
     });
 
     describe('currency handling', function () {
