@@ -8,33 +8,101 @@ Maintainer:  ssp-dev@supership.jp
 
 #### About
 
-This analytics adapter collects, per auction, the bidding performance of all
-bidders participating in your ad units (cpm / currency / response time / media
-type / size / win) and sends it to AdGeneration's analytics endpoint. The data
-is aggregated per auction and sent on `AUCTION_END`, while `BID_WON`,
-`BID_VIEWABLE` and ad render results are sent individually as follow-up events.
+This analytics adapter collects the bidding results of ad units that include an
+AdGeneration (`adgeneration`, or one of its aliases) bid request, and sends them
+to AdGeneration's analytics endpoint. For each such ad unit it reports the
+status of every bidder (cpm / currency / response time / media type / size), so
+AdGeneration can compare its results with the other bidders.
 
-Within the auction report, each bidder entry carries a `status` of
-`requested`, `bid`, `noBid`, `timeout` or `rejected`. A successful
-`BID_RESPONSE` always wins over the other statuses. Because a single bidder can
-respond multiple times (multi-format / multibid), successful responses are
-collected in a `bids` array, and rejected responses (with their `reason`) in a
-`rejectedBids` array.
+Which ad units are sent is decided per AdGeneration bid request, by hashing its
+`bidId` (see [Sampling](#sampling)). Nothing is sent unless both `endpoint` and
+`ratio` are configured.
 
-Reports are sent with `navigator.sendBeacon()` so they are not lost even when
-the page is unloaded; if `sendBeacon` is unavailable the adapter falls back to
-an `ajax` POST.
+#### Events
+
+Each request body carries page-level values once, and an `events` array:
+
+```json
+{
+  "v": 1,
+  "analyticsVersion": "2.0.0",
+  "pbjsVersion": "11.44.0",
+  "page": "https://example.com/article/1",
+  "events": [
+    {
+      "type": "auctionEnd",
+      "ts": 1794386087018,
+      "bidId": "6f1c2d3e-...",
+      "auctionId": "a1b2c3",
+      "adUnitCode": "div-1",
+      "data": {
+        "bidders": {
+          "adgeneration": { "status": "noBid" },
+          "appnexus": { "status": "bid", "bids": [{ "adId": "x1", "cpm": 0.42, "currency": "JPY", "timeToRespond": 210 }] }
+        }
+      }
+    }
+  ]
+}
+```
+
+- `bidId` is the `bidId` of the AdGeneration bid request for that ad unit (the
+  same value as `imp.id` in the request sent to AdGeneration). It is available
+  even when AdGeneration times out.
+- Consent data (`gdpr`, `gdprConsent`, `usPrivacy`, `gpp`, `gppSid`, `coppa`) is
+  added to the top level when available.
+
+| `type`           | Sent on            | `data` |
+|------------------|--------------------|--------|
+| `auctionEnd`     | `AUCTION_END`      | `bidders`: status of every bidder of the ad unit. `status` is `requested`, `bid`, `noBid`, `timeout` or `rejected`. A successful `BID_RESPONSE` always wins over the other statuses. Successful responses are collected in `bids`, rejected responses (with their `reason`) in `rejectedBids`. |
+| `bidWon`         | `BID_WON`          | `bidder` and the bid fields (`adId`, `cpm`, ...). |
+| `adRenderFailed` | `AD_RENDER_FAILED` | `adId`, `reason`, `message`. |
+| `viewable`       | `BID_VIEWABLE`     | `adId`, `bidder`, `mediaType`. |
+
+Follow-up events (`bidWon`, `adRenderFailed`, `viewable`) are sent only for ad
+units that were sent on `AUCTION_END`, for the latest 50 auctions.
+
+#### Batching
+
+Events are queued and sent together:
+
+- The first queued event starts a timer of `batchDelay` ms (1000 by default).
+  When it fires, every queued event is sent in one request. Later events do not
+  extend the wait; the next event after sending starts a new timer.
+- If adding an event would make the body larger than 60KB, the queued events are
+  sent first.
+- When the page becomes hidden (`visibilitychange`) or is unloaded
+  (`pagehide`), the queued events are sent immediately.
+
+Requests are sent with `navigator.sendBeacon()`; if it is unavailable the
+adapter falls back to an `ajax` POST with `keepalive`. The body is JSON sent as
+`text/plain` to avoid a CORS preflight.
+
+#### Sampling
+
+An AdGeneration bid request is sent when
+
+```txt
+fnv1a32(bidId) % 10000 < round(ratio * 10000)
+```
+
+where `fnv1a32` is FNV-1a 32bit over the UTF-8 bytes of `bidId`. The receiver can
+reproduce the decision from the `bidId`, so the ad units that were not sent can
+also be counted.
+
+Do not use the analytics base option `sampling` (a per-session random draw) with
+this adapter; it is ignored with a warning, because it would make the decision
+impossible to reproduce from the `bidId`.
 
 #### Known limitations
 
-- The auction report is a snapshot taken at `AUCTION_END`. Bid responses that
-  arrive after `AUCTION_END` are not included, because the core still emits
+- The `auctionEnd` event is a snapshot taken at `AUCTION_END`. Bid responses
+  that arrive after `AUCTION_END` are not included, because the core still emits
   `BID_RESPONSE` for late responses that come in after the auction timeout.
   Such bidders are reported with the status `timeout`.
-- Payloads larger than 64KB cannot be sent with `navigator.sendBeacon`, and the
-  `ajax` fallback loses `keepalive`. A very large report (roughly 250+ bid
-  entries) may therefore be lost if the page is unloaded right after
-  `AUCTION_END`.
+- If an ad unit has two or more AdGeneration bid requests (for example with
+  different params), one event is sent per selected `bidId`, and they share the
+  same bidder entry in `bidders`.
 
 #### Viewability
 
@@ -52,10 +120,11 @@ pbjs.setConfig({ bidViewabilityIO: { enabled: true } });
 
 #### Analytics Options
 
-| Name       | Scope    | Example                                    | Type     | Description |
-|------------|----------|--------------------------------------------|----------|-------------|
-| `endpoint` | optional | `https://d.socdm.com/adgen/analytics`      | `string` | Endpoint that receives the analytics reports. Defaults to the AdGeneration production endpoint. |
-| `sampling` | optional | `1.0`                                      | `float`  | Sampling rate between `0.0` and `1.0`. Data is collected only on this ratio of browser sessions (handled by the analytics base). |
+| Name         | Scope    | Example                               | Type     | Description |
+|--------------|----------|---------------------------------------|----------|-------------|
+| `endpoint`   | required | `https://d.socdm.com/adgen/analytics` | `string` | Endpoint that receives the events. Must be `https` on `socdm.com` or `scaleout.jp` (or their subdomains). Nothing is sent without it. |
+| `ratio`      | required | `0.1`                                 | `number` | Ratio of AdGeneration bid requests to send, between `0` and `1`. Defaults to `0` (nothing is sent). |
+| `batchDelay` | optional | `1000`                                | `number` | Time in ms to wait from the first queued event before sending, between `0` and `5000`. Defaults to `1000`. `0` sends every event immediately. |
 
 #### Build
 
@@ -69,16 +138,12 @@ gulp build --modules=adgenerationBidAdapter,adgenerationAnalyticsAdapter,bidView
 pbjs.enableAnalytics({
     provider: 'adgeneration',
     options: {
-        /**
-         * Endpoint that receives the analytics reports.
-         * [optional] Defaults to the AdGeneration production endpoint.
-         */
         endpoint: 'https://d.socdm.com/adgen/analytics',
+        ratio: 0.1,
         /**
-         * Sampling rate between 0.0 and 1.0.
-         * [optional]
+         * [optional] Defaults to 1000.
          */
-        sampling: 1.0
+        batchDelay: 1000
     }
 });
 ```

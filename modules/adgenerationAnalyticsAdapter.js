@@ -1,4 +1,4 @@
-import { logInfo, logError } from '../src/utils.js';
+import { logInfo, logError, logWarn } from '../src/utils.js';
 import adapter from '../libraries/analyticsAdapter/AnalyticsAdapter.js';
 import adapterManager, { coppaDataHandler, gdprDataHandler, gppDataHandler, uspDataHandler } from '../src/adapterManager.js';
 import { EVENTS } from '../src/constants.js';
@@ -6,8 +6,20 @@ import { ajax, sendBeacon } from '../src/ajax.js';
 import { getRefererInfo } from '../src/refererDetection.js';
 
 const PROVIDER_CODE = 'adgeneration';
-const ANALYTICS_VERSION = '1.0.0';
-const DEFAULT_ENDPOINT = 'https://d.socdm.com/adgen/analytics';
+const ANALYTICS_VERSION = '2.0.0';
+/** 送信本文の形式のバージョン。 */
+const PAYLOAD_VERSION = 1;
+/** 送信先として受理するドメイン（完全一致またはサブドメイン）。 */
+const ALLOWED_ENDPOINT_DOMAINS = ['socdm.com', 'scaleout.jp'];
+/** 後追いイベント判定用に保持する auction 数の上限（超えたら古いものから破棄）。 */
+const REGISTRY_MAX_AUCTIONS = 50;
+/** 送信待ちイベントをまとめる待ち時間（ms）の既定値と上限。 */
+const DEFAULT_BATCH_DELAY = 1000;
+const MAX_BATCH_DELAY = 5000;
+/** 1 回に送る本文の上限（バイト）。sendBeacon の上限 64KB に余裕を残す。 */
+const MAX_BODY_BYTES = 60 * 1024;
+/** 送信割合の判定に使うハッシュの剰余。割合は 0.01% 単位になる。 */
+const SAMPLING_BUCKETS = 10000;
 
 const {
   AUCTION_INIT,
@@ -18,7 +30,6 @@ const {
   BID_REJECTED,
   AUCTION_END,
   BID_WON,
-  AD_RENDER_SUCCEEDED,
   AD_RENDER_FAILED,
   BID_VIEWABLE,
 } = EVENTS;
@@ -26,19 +37,128 @@ const {
 const LOG_PREFIX = `${PROVIDER_CODE} analytics: `;
 
 /**
- * オークション単位でイベントを蓄積し、AUCTION_END でまとめて送信するためのキャッシュ。
- * BID_WON / AD_RENDER_* / BID_VIEWABLE は後追いで個別送信する。
- * テストから状態を初期化できるよう export する。
+ * アダプターの状態。テストから初期化できるよう export する。
  */
 export const locals = {
-  endpoint: DEFAULT_ENDPOINT,
-  /** @type {Object<string, Object>} auctionId -> オークション集約データ */
+  /** @type {string|null} 送信先。null なら何も送らない */
+  endpoint: null,
+  /** 送る割合（0〜1）。ADG の bid request の bidId のハッシュで判定する */
+  ratio: 0,
+  /** 送信待ちイベントをまとめる待ち時間（ms） */
+  batchDelay: DEFAULT_BATCH_DELAY,
+  /** @type {Object<string, Object>} auctionId -> AUCTION_END まで蓄積するオークション集約データ */
   auctions: {},
+  /**
+   * AUCTION_END 後も後追いイベントを判定するための送信対象枠の記録。
+   * auctionId -> { units: { adUnitCode -> ADG の bidId[] }, adIds: { adId -> adUnitCode } }
+   * 挿入順に REGISTRY_MAX_AUCTIONS 件まで保持する。
+   * @type {Object<string, Object>}
+   */
+  registry: {},
+  /** @type {string[]} registry の auctionId（古い順） */
+  registryOrder: [],
+  /** @type {Object[]} 送信待ちのイベント */
+  queue: [],
+  /** queue の各イベントを JSON にしたときのバイト数の合計 */
+  queueBytes: 0,
+  /** @type {*} queue を送り出すタイマー */
+  timer: null,
   reset() {
-    this.endpoint = DEFAULT_ENDPOINT;
+    if (this.timer) clearTimeout(this.timer);
+    this.endpoint = null;
+    this.ratio = 0;
+    this.batchDelay = DEFAULT_BATCH_DELAY;
     this.auctions = {};
+    this.registry = {};
+    this.registryOrder = [];
+    this.queue = [];
+    this.queueBytes = 0;
+    this.timer = null;
   },
 };
+
+function byteLength(str) {
+  return new TextEncoder().encode(str).length;
+}
+
+/**
+ * FNV-1a 32bit（文字列を UTF-8 のバイト列として計算し、符号なし整数を返す）。
+ * 受信側が bidId から送信対象かを再現できるよう、判定方法は仕様として共有する。
+ * テストから検証できるよう export する。
+ */
+export function fnv1a32(str) {
+  const bytes = new TextEncoder().encode(String(str));
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i++) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * bidId が送信対象かを判定する: hash(bidId) % 10000 < round(ratio × 10000)。
+ * テストから検証できるよう export する。
+ */
+export function isSampled(bidId, ratio) {
+  if (!bidId || !(ratio > 0)) return false;
+  return fnv1a32(bidId) % SAMPLING_BUCKETS < Math.round(ratio * SAMPLING_BUCKETS);
+}
+
+/**
+ * 送信先 URL を検証する。https かつ許可ドメイン（およびサブドメイン）のみ受理する。
+ * テストから検証できるよう export する。
+ */
+export function isAllowedEndpoint(value) {
+  if (typeof value !== 'string' || !value) return false;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    return ALLOWED_ENDPOINT_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`));
+  } catch (e) {
+    return false;
+  }
+}
+
+function isAdgBidder(bidder) {
+  return !!bidder && adapterManager.resolveAlias(bidder) === PROVIDER_CODE;
+}
+
+/**
+ * AUCTION_END で送信対象枠を registry に登録し、上限を超えたら古い auction から破棄する。
+ */
+function registerTargets(auctionId, units, adIds) {
+  if (!locals.registry[auctionId]) {
+    locals.registryOrder.push(auctionId);
+  }
+  locals.registry[auctionId] = { units, adIds };
+  while (locals.registryOrder.length > REGISTRY_MAX_AUCTIONS) {
+    delete locals.registry[locals.registryOrder.shift()];
+  }
+}
+
+/**
+ * 後追いイベントの対象枠なら、その枠の ADG の bidId の配列を返す（対象外は undefined）。
+ */
+function lookupTargetBidIds(auctionId, adUnitCode) {
+  const entry = locals.registry[auctionId];
+  return entry && entry.units[adUnitCode];
+}
+
+/**
+ * adId から対象枠の (auctionId, adUnitCode) を逆引きする。
+ * AD_RENDER_FAILED で bid が付かない場合（CANNOT_FIND_AD 等）に使う。
+ */
+function findTargetByAdId(adId) {
+  if (!adId) return null;
+  for (let i = locals.registryOrder.length - 1; i >= 0; i--) {
+    const auctionId = locals.registryOrder[i];
+    const adUnitCode = locals.registry[auctionId].adIds[adId];
+    if (adUnitCode) return { auctionId, adUnitCode };
+  }
+  return null;
+}
 
 /**
  * BID_RESPONSE / BID_REJECTED / BID_WON で共通して bid から抜き出すフィールド。
@@ -76,13 +196,22 @@ function onAuctionInit({ auctionId, timestamp }) {
     auctionId,
     timestamp,
     adUnits: {}, // adUnitCode -> { bidders: { [bidder]: {...} } }
+    targets: {}, // adUnitCode -> 送信対象に当たった ADG の bidId[]
   };
 }
 
 function onBidRequested({ auctionId, bids = [] }) {
   bids.forEach((bid) => {
     const entry = getBidderEntry(auctionId, bid.adUnitCode, bid.bidder);
-    if (entry) entry.status = 'requested';
+    if (!entry) return;
+    entry.status = 'requested';
+    // ADG の bid request（alias 含む）の bidId で、この枠を送るかを決める。
+    // bidId は ADG へのリクエストの imp.id と同じ値で、timeout の枠でも取れる。
+    if (isAdgBidder(bid.bidder) && isSampled(bid.bidId, locals.ratio)) {
+      const targets = locals.auctions[auctionId].targets;
+      const ids = (targets[bid.adUnitCode] = targets[bid.adUnitCode] || []);
+      if (!ids.includes(bid.bidId)) ids.push(bid.bidId);
+    }
   });
 }
 
@@ -121,40 +250,71 @@ function onBidRejected(bid) {
   });
 }
 
+/**
+ * 送信対象枠ごと・ADG の bidId ごとに auctionEnd イベントを 1 件積む。
+ * 中身はその枠の全 bidder の状態（他 bidder の入札も含む）。
+ */
 function onAuctionEnd({ auctionId }) {
   const auction = locals.auctions[auctionId];
   if (!auction) return;
-  send(buildAuctionReport(auction));
   delete locals.auctions[auctionId];
+  const codes = Object.keys(auction.targets).filter((code) => auction.adUnits[code]);
+  // 対象枠が 1 つも無い auction は何も送らない。
+  if (!codes.length) return;
+
+  // 後追いイベント用に対象枠と、その枠の bid の adId を記録する。
+  // rejectedBids は描画されないため adRenderFailed 逆引き用の adId には登録しない。
+  const units = {};
+  const adIds = {};
+  codes.forEach((code) => {
+    const bidIds = auction.targets[code];
+    units[code] = bidIds;
+    const bidders = auction.adUnits[code].bidders;
+    Object.keys(bidders).forEach((bidder) => {
+      (bidders[bidder].bids || []).forEach(({ adId }) => {
+        if (adId) adIds[adId] = code;
+      });
+    });
+    bidIds.forEach((bidId) => {
+      enqueue(buildEvent('auctionEnd', bidId, auctionId, code, { bidders }));
+    });
+  });
+  registerTargets(auctionId, units, adIds);
+}
+
+/**
+ * 後追いイベントを、対象枠の ADG の bidId ごとに積む（対象外の枠は何もしない）。
+ */
+function enqueueFollowUp(type, auctionId, adUnitCode, data) {
+  const bidIds = lookupTargetBidIds(auctionId, adUnitCode);
+  if (!bidIds) return;
+  bidIds.forEach((bidId) => enqueue(buildEvent(type, bidId, auctionId, adUnitCode, data)));
 }
 
 function onBidWon(bid) {
-  send({
-    type: 'bidWon',
-    auctionId: bid.auctionId,
-    adUnitCode: bid.adUnitCode,
+  enqueueFollowUp('bidWon', bid.auctionId, bid.adUnitCode, {
     bidder: bid.bidderCode,
     ...pickBidFields(bid),
   });
 }
 
-function onAdRender(eventType, args) {
+function onAdRenderFailed(args) {
   const bid = args.bid;
-  send({
-    type: eventType, // 定数値が 'adRenderSucceeded' / 'adRenderFailed' そのものなので変換不要
-    auctionId: bid && bid.auctionId,
-    adUnitCode: bid && bid.adUnitCode,
-    adId: args.adId || (bid && bid.adId),
-    reason: args.reason, // FAILED のみ存在（undefined は JSON.stringify で落ちる）
-    message: args.message, // 同上
+  const adId = args.adId || (bid && bid.adId);
+  // bid が付かない場合（CANNOT_FIND_AD 等）は AUCTION_END で記録した adId から枠を逆引きする。
+  const target = bid
+    ? { auctionId: bid.auctionId, adUnitCode: bid.adUnitCode }
+    : findTargetByAdId(adId);
+  if (!target) return;
+  enqueueFollowUp('adRenderFailed', target.auctionId, target.adUnitCode, {
+    adId,
+    reason: args.reason,
+    message: args.message,
   });
 }
 
 function onBidViewable(bid) {
-  send({
-    type: 'viewable',
-    auctionId: bid.auctionId,
-    adUnitCode: bid.adUnitCode,
+  enqueueFollowUp('viewable', bid.auctionId, bid.adUnitCode, {
     adId: bid.adId, // bids[] / bidWon と突合するためのキー
     bidder: bid.bidderCode,
     mediaType: bid.mediaType,
@@ -162,20 +322,30 @@ function onBidViewable(bid) {
 }
 
 /**
- * オークション集約データを送信用レポートに整形する。同意情報は send() で付与する。
+ * 送信本文の events 配列に入れる 1 件を作る。テストから検証できるよう export する。
+ */
+export function buildEvent(type, bidId, auctionId, adUnitCode, data) {
+  return {
+    type,
+    ts: Date.now(),
+    bidId,
+    auctionId,
+    adUnitCode,
+    data,
+  };
+}
+
+/**
+ * ページ単位の値（版・ページ URL・同意情報）。送信本文の最上位に 1 回だけ置く。
  * テストから検証できるよう export する。
  */
-export function buildAuctionReport(auction) {
-  const report = {
-    type: 'auction',
+export function buildEnvelope() {
+  return addConsentData({
+    v: PAYLOAD_VERSION,
     analyticsVersion: ANALYTICS_VERSION,
     pbjsVersion: '$prebid.version$', // ビルドスクリプトで実バージョンに置換される
-    referrer: getRefererInfo().page || window.location.href,
-    auctionId: auction.auctionId,
-    timestamp: auction.timestamp,
-    adUnits: auction.adUnits,
-  };
-  return report;
+    page: getRefererInfo().page || window.location.href,
+  });
 }
 
 /**
@@ -203,12 +373,51 @@ function addConsentData(report) {
 }
 
 /**
+ * イベントを送信待ちの列に積む。
+ * - 列が空のときに積んだら待ち時間のタイマーを張る（後続のイベントで延長しない）
+ * - 積むと本文が上限を超える場合は、先に今の列を送ってから積む
+ * - 待ち時間 0 は待たずに送る
+ */
+function enqueue(event) {
+  if (!locals.endpoint) return;
+  const eventBytes = byteLength(JSON.stringify(event));
+  if (locals.queue.length) {
+    // 本文 = 最上位の値 + events 配列（イベント間のカンマを含む）
+    const projected = byteLength(JSON.stringify(buildEnvelope())) + locals.queueBytes +
+      eventBytes + locals.queue.length + 20;
+    if (projected > MAX_BODY_BYTES) flush();
+  }
+  locals.queue.push(event);
+  locals.queueBytes += eventBytes;
+  if (locals.batchDelay === 0) {
+    flush();
+  } else if (!locals.timer) {
+    locals.timer = setTimeout(flush, locals.batchDelay);
+  }
+}
+
+/**
+ * 送信待ちの列をまとめて 1 本で送る。テストから呼べるよう export する。
+ */
+export function flush() {
+  if (locals.timer) {
+    clearTimeout(locals.timer);
+    locals.timer = null;
+  }
+  if (!locals.queue.length) return;
+  const events = locals.queue;
+  locals.queue = [];
+  locals.queueBytes = 0;
+  if (!locals.endpoint) return;
+  send({ ...buildEnvelope(), events });
+}
+
+/**
  * ページ遷移後も欠損しにくい sendBeacon を優先し、利用不可なら ajax にフォールバックする。
- * 同意情報はここで付与し、集約送信・後追い送信の双方で確実に同梱されるようにする。
  * Content-Type は preflight(OPTIONS) を避けるため text/plain とする（サーバー側で JSON パースする）。
  */
 function send(payload) {
-  const body = JSON.stringify(addConsentData(payload));
+  const body = JSON.stringify(payload);
   if (sendBeacon(locals.endpoint, body)) {
     logInfo(`${LOG_PREFIX}report sent`, payload);
     return;
@@ -218,6 +427,19 @@ function send(payload) {
     method: 'POST',
     keepalive: true,
   });
+}
+
+/**
+ * タブが隠れた・ページを離れるときは、待たずに列を送る（待ち時間中に閉じられると消えるため）。
+ */
+let unloadListenersAdded = false;
+function addUnloadListeners() {
+  if (unloadListenersAdded) return;
+  unloadListenersAdded = true;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flush();
+  });
+  window.addEventListener('pagehide', flush);
 }
 
 function handleEvent({ eventType, args }) {
@@ -246,9 +468,8 @@ function handleEvent({ eventType, args }) {
     case BID_WON:
       onBidWon(args);
       break;
-    case AD_RENDER_SUCCEEDED:
     case AD_RENDER_FAILED:
-      onAdRender(eventType, args);
+      onAdRenderFailed(args);
       break;
     case BID_VIEWABLE:
       onBidViewable(args);
@@ -258,34 +479,52 @@ function handleEvent({ eventType, args }) {
   }
 }
 
-/**
- * endpoint が http(s) の絶対 URL かどうかを検証する。
- */
-function isValidEndpoint(value) {
-  if (typeof value !== 'string') return false;
-  try {
-    return ['http:', 'https:'].includes(new URL(value).protocol);
-  } catch (e) {
-    return false;
-  }
-}
-
 const adgAnalytics = Object.assign(adapter({ analyticsType: 'endpoint' }), {
   track: handleEvent,
 });
 
-function enableAnalyticsWrapper(config) {
-  const options = (config && config.options) || {};
-  if (isValidEndpoint(options.endpoint)) {
+function resolveOptions(options) {
+  if (isAllowedEndpoint(options.endpoint)) {
     locals.endpoint = options.endpoint;
   } else {
-    if (options.endpoint) {
-      logError(`${LOG_PREFIX}invalid endpoint, using default`, options.endpoint);
+    if (options.endpoint !== undefined) {
+      logError(`${LOG_PREFIX}endpoint must be https on socdm.com or scaleout.jp, nothing will be sent`, options.endpoint);
+    } else {
+      logWarn(`${LOG_PREFIX}no endpoint, nothing will be sent`);
     }
-    locals.endpoint = DEFAULT_ENDPOINT;
+    locals.endpoint = null;
   }
-  logInfo(`${LOG_PREFIX}enabled`, config);
-  adgAnalytics.originEnableAnalytics(config);
+
+  const ratio = options.ratio;
+  if (typeof ratio === 'number' && ratio >= 0 && ratio <= 1) {
+    locals.ratio = ratio;
+  } else {
+    if (ratio !== undefined) logError(`${LOG_PREFIX}ratio must be a number between 0 and 1, using 0`, ratio);
+    locals.ratio = 0;
+  }
+
+  const delay = options.batchDelay;
+  if (typeof delay === 'number' && delay >= 0 && delay <= MAX_BATCH_DELAY) {
+    locals.batchDelay = delay;
+  } else {
+    if (delay !== undefined) logError(`${LOG_PREFIX}batchDelay must be 0-${MAX_BATCH_DELAY} ms, using ${DEFAULT_BATCH_DELAY}`, delay);
+    locals.batchDelay = DEFAULT_BATCH_DELAY;
+  }
+}
+
+function enableAnalyticsWrapper(config) {
+  const options = (config && config.options) || {};
+  resolveOptions(options);
+  let baseConfig = config;
+  if (options.sampling !== undefined) {
+    // 基盤の options.sampling はセッション単位の抽選で、bidId による判定と二重になり受信側で再現できない。
+    logWarn(`${LOG_PREFIX}options.sampling is ignored, use options.ratio`);
+    const { sampling, ...rest } = options;
+    baseConfig = { ...config, options: rest };
+  }
+  addUnloadListeners();
+  logInfo(`${LOG_PREFIX}enabled`, baseConfig);
+  adgAnalytics.originEnableAnalytics(baseConfig);
 }
 
 adgAnalytics.originEnableAnalytics = adgAnalytics.enableAnalytics;
@@ -296,9 +535,8 @@ adgAnalytics.disableAnalytics = function () {
   // 基盤の disable は enableAnalytics を素の実装へ差し戻すため、このラッパーを _oldEnable に戻して恒久的な喪失を防ぐ。
   adgAnalytics._oldEnable = enableAnalyticsWrapper;
   // consent 変化時の disable→enable では、基盤の replay が flush 済みウォーターマークより後のイベントしか再送しない。
-  // 進行中オークションの track 済みイベント（AUCTION_INIT 等）は再構築できないため locals.auctions は保持する。
-  // endpoint も保持する（基盤の debounce queue は disable でクリアされないため、直後に flush される
-  // pending イベントを正しい宛先へ送る。次の enable で必ず再設定される）。
+  // 進行中オークションの track 済みイベント（AUCTION_INIT 等）は再構築できないため、locals（auctions・registry・
+  // 送信待ちの列・タイマー・送信先）は保持する。次の enable で設定は必ず再設定される。
   adgAnalytics.originDisableAnalytics();
 };
 
