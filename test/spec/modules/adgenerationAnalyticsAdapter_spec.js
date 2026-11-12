@@ -686,7 +686,7 @@ describe('ADG Analytics Adapter', () => {
       events.emit(EVENTS.AUCTION_INIT, auctionInit);
       events.emit(EVENTS.BID_REQUESTED, bidRequested);
       adgAnalyticsAdapter.disableAnalytics();
-      // 基盤の debounce キューは disable で捨てられないため、disable 後に track が呼ばれうる。
+      // 基盤は disable で debounce の列を捨てるが、disable 後に track が直接呼ばれても積まないこと。
       adgAnalyticsAdapter.track({ eventType: EVENTS.AUCTION_END, args: { auctionId: AUCTION_ID } });
       clock.tick(BATCH_DELAY);
       expect(locals.queue).to.have.lengthOf(0);

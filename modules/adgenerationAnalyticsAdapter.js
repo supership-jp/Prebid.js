@@ -560,8 +560,8 @@ adgAnalytics.disableAnalytics = function () {
   // consent 変化時の disable→enable では、基盤の replay が flush 済みウォーターマークより後のイベントしか再送しない。
   // 進行中オークションの track 済みイベント（AUCTION_INIT 等）は再構築できないため、locals（auctions・registry・
   // 送信待ちの列・送信先）は保持する。次の enable で設定は必ず再設定される。
-  // ただし disable は同意の撤回などで呼ばれるため、送信は止める（タイマーを外し、離脱時のリスナーや
-  // disable 後に基盤の debounce キューから届くイベントでも送らない）。
+  // ただし disable は同意の撤回などで呼ばれるため、送信は止める（タイマーを外し、離脱時のリスナーでも送らない）。
+  // 基盤は disable で debounce の列を捨てるが、disable 後に track が呼ばれた場合に備えて enqueue でも止める。
   locals.active = false;
   if (locals.timer) {
     clearTimeout(locals.timer);
