@@ -3,7 +3,8 @@ import { getCurrencyFromBidderRequest } from '../libraries/ortb2Utils/currency.j
 import { tryAppendQueryString } from '../libraries/urlUtils/urlUtils.js';
 import { registerBidder } from '../src/adapters/bidderFactory.js';
 import { BANNER, NATIVE } from '../src/mediaTypes.js';
-import { getBidIdParameter, deepSetValue, prefixLog } from '../src/utils.js';
+import { getBidIdParameter, deepSetValue, deepClone, prefixLog } from '../src/utils.js';
+import { EVENT_TYPE_IMPRESSION, TRACKER_METHOD_IMG } from '../src/eventTrackers.js';
 import { ortbConverter } from '../libraries/ortbConverter/converter.js';
 const adgLogger = prefixLog('Adgeneration: ');
 
@@ -17,7 +18,7 @@ const adgLogger = prefixLog('Adgeneration: ');
 
 const ADG_BIDDER_CODE = 'adgeneration';
 const ACP_ID = 2567; // Google Additional Consent provider ID
-const ADGENE_PREBID_VERSION = '1.7.0';
+const ADGENE_PREBID_VERSION = '1.10.0';
 const DEBUG_URL = 'https://api-test.scaleout.jp/adgen/prebid';
 const URL = 'https://d.socdm.com/adgen/prebid';
 
@@ -202,51 +203,29 @@ function isNative(adResult) {
   return adResult.native && adResult.native.assets.length > 0;
 }
 
+/**
+ * Pass the OpenRTB Native response from the ADG server to Prebid as-is (`native: { ortb }`).
+ * Asset ids are expected to match the request (adUnit), so no remapping is done here.
+ * The ADG impression beacon (`beaconurl`) is returned outside `native`; add it as an
+ * impression/img event tracker only when the same URL is not already in `imptrackers`
+ * or in an impression `eventtrackers` entry, so it never fires twice if the server
+ * starts to put it into `native` itself.
+ */
 function createNativeAd(nativeAd, beaconUrl) {
-  const native = {};
-  if (nativeAd && nativeAd.assets.length > 0) {
-    const assets = nativeAd.assets;
-    for (let i = 0, len = assets.length; i < len; i++) {
-      switch (assets[i].id) {
-        case 1:
-          native.title = assets[i].title.text;
-          break;
-        case 2:
-          native.image = {
-            url: assets[i].img.url,
-            height: assets[i].img.h,
-            width: assets[i].img.w,
-          };
-          break;
-        case 3:
-          native.icon = {
-            url: assets[i].img.url,
-            height: assets[i].img.h,
-            width: assets[i].img.w,
-          };
-          break;
-        case 4:
-          native.sponsoredBy = assets[i].data.value;
-          break;
-        case 5:
-          native.body = assets[i].data.value;
-          break;
-        case 6:
-          native.cta = assets[i].data.value;
-          break;
-        case 502:
-          native.privacyLink = assets[i].data.value;
-          break;
-      }
-    }
-    native.clickUrl = nativeAd.link.url;
-    native.clickTrackers = nativeAd.link.clicktrackers || [];
-    native.impressionTrackers = nativeAd.imptrackers || [];
-    if (beaconUrl) {
-      native.impressionTrackers.push(beaconUrl);
-    }
+  const ortb = deepClone(nativeAd);
+  if (beaconUrl && !hasImpressionTracker(ortb, beaconUrl)) {
+    ortb.eventtrackers = (ortb.eventtrackers || []).concat({
+      event: EVENT_TYPE_IMPRESSION,
+      method: TRACKER_METHOD_IMG,
+      url: beaconUrl
+    });
   }
-  return native;
+  return { ortb };
+}
+
+function hasImpressionTracker(ortb, url) {
+  if ((ortb.imptrackers || []).includes(url)) return true;
+  return (ortb.eventtrackers || []).some(tracker => tracker.event === EVENT_TYPE_IMPRESSION && tracker.url === url);
 }
 
 function appendChildToBody(ad, data) {
