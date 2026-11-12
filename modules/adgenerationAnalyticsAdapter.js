@@ -15,7 +15,7 @@ const ANALYTICS_VERSION = '2.0.0';
 const PAYLOAD_VERSION = 1;
 /** 送信先として受理するドメイン（完全一致またはサブドメイン）。 */
 const ALLOWED_ENDPOINT_DOMAINS = ['socdm.com', 'scaleout.jp'];
-/** 後追いイベント判定用に保持する auction 数の上限（超えたら古いものから破棄）。 */
+/** オークション後のイベント判定用に保持する auction 数の上限（超えたら古いものから破棄）。 */
 const REGISTRY_MAX_AUCTIONS = 50;
 /** 送信待ちイベントをまとめる待ち時間（ms）の既定値と上限。 */
 const DEFAULT_BATCH_DELAY = 1000;
@@ -58,7 +58,7 @@ export const locals = {
   /** @type {Object<string, Object>} auctionId -> AUCTION_END まで蓄積するオークション集約データ */
   auctions: {},
   /**
-   * AUCTION_END 後も後追いイベントを判定するための送信対象枠の記録。
+   * AUCTION_END 後もオークション後のイベントを判定するための送信対象枠の記録。
    * auctionId -> { units: { adUnitCode -> ADG の bidId[] }, adIds: { adId -> adUnitCode } }
    * 挿入順に REGISTRY_MAX_AUCTIONS 件まで保持する。
    * @type {Object<string, Object>}
@@ -149,7 +149,7 @@ function registerTargets(auctionId, units, adIds) {
 }
 
 /**
- * 後追いイベントの対象枠なら、その枠の ADG の bidId の配列を返す（対象外は undefined）。
+ * オークション後のイベントの対象枠なら、その枠の ADG の bidId の配列を返す（対象外は undefined）。
  */
 function lookupTargetBidIds(auctionId, adUnitCode) {
   const entry = locals.registry[auctionId];
@@ -272,7 +272,7 @@ function onAuctionEnd({ auctionId }) {
   // 対象枠が 1 つも無い auction は何も送らない。
   if (!codes.length) return;
 
-  // 後追いイベント用に対象枠と、その枠の bid の adId を記録する。
+  // オークション後のイベント用に対象枠と、その枠の bid の adId を記録する。
   // rejectedBids は描画されないため adRenderFailed 逆引き用の adId には登録しない。
   const units = {};
   const adIds = {};
@@ -293,7 +293,7 @@ function onAuctionEnd({ auctionId }) {
 }
 
 /**
- * 後追いイベントを、対象枠の ADG の bidId ごとに積む（対象外の枠は何もしない）。
+ * オークション後のイベントを、対象枠の ADG の bidId ごとに積む（対象外の枠は何もしない）。
  */
 function enqueueFollowUp(type, auctionId, adUnitCode, data) {
   const bidIds = lookupTargetBidIds(auctionId, adUnitCode);
