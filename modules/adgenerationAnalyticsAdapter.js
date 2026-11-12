@@ -5,6 +5,10 @@ import { EVENTS } from '../src/constants.js';
 import { ajax, sendBeacon } from '../src/ajax.js';
 import { getRefererInfo } from '../src/refererDetection.js';
 
+/**
+ * @typedef {import('./adgenerationAnalyticsAdapter.d.ts').AdgenerationAnalyticsAdapterOptions} AdgenerationAnalyticsAdapterOptions
+ */
+
 const PROVIDER_CODE = 'adgeneration';
 const ANALYTICS_VERSION = '2.0.0';
 /** 送信本文の形式のバージョン。 */
@@ -40,6 +44,11 @@ const LOG_PREFIX = `${PROVIDER_CODE} analytics: `;
  * アダプターの状態。テストから初期化できるよう export する。
  */
 export const locals = {
+  /**
+   * enable 中か。disable（同意の撤回・activity control での拒否）の間は送らない。
+   * 基盤の enabled は過去イベントの replay が終わってから true になるため、独自に持つ。
+   */
+  active: false,
   /** @type {string|null} 送信先。null なら何も送らない */
   endpoint: null,
   /** 送る割合（0〜1）。ADG の bid request の bidId のハッシュで判定する */
@@ -65,6 +74,7 @@ export const locals = {
   timer: null,
   reset() {
     if (this.timer) clearTimeout(this.timer);
+    this.active = false;
     this.endpoint = null;
     this.ratio = 0;
     this.batchDelay = DEFAULT_BATCH_DELAY;
@@ -379,7 +389,7 @@ function addConsentData(report) {
  * - 待ち時間 0 は待たずに送る
  */
 function enqueue(event) {
-  if (!locals.endpoint) return;
+  if (!locals.active || !locals.endpoint) return;
   const eventBytes = byteLength(JSON.stringify(event));
   if (locals.queue.length) {
     // 本文 = 最上位の値 + events 配列（イベント間のカンマを含む）
@@ -404,7 +414,8 @@ export function flush() {
     clearTimeout(locals.timer);
     locals.timer = null;
   }
-  if (!locals.queue.length) return;
+  // disable 中は送らない（列は残し、再 enable で送る）。
+  if (!locals.active || !locals.queue.length) return;
   const events = locals.queue;
   locals.queue = [];
   locals.queueBytes = 0;
@@ -512,9 +523,13 @@ function resolveOptions(options) {
   }
 }
 
+/**
+ * @param {{provider: string, options?: AdgenerationAnalyticsAdapterOptions}} config
+ */
 function enableAnalyticsWrapper(config) {
   const options = (config && config.options) || {};
   resolveOptions(options);
+  locals.active = true;
   let baseConfig = config;
   if (options.sampling !== undefined) {
     // 基盤の options.sampling はセッション単位の抽選で、bidId による判定と二重になり受信側で再現できない。
@@ -525,6 +540,14 @@ function enableAnalyticsWrapper(config) {
   addUnloadListeners();
   logInfo(`${LOG_PREFIX}enabled`, baseConfig);
   adgAnalytics.originEnableAnalytics(baseConfig);
+  // disable 中に残った送信待ちの列があれば、待ち時間を張り直す。
+  if (locals.queue.length && !locals.timer) {
+    if (locals.batchDelay === 0) {
+      flush();
+    } else {
+      locals.timer = setTimeout(flush, locals.batchDelay);
+    }
+  }
 }
 
 adgAnalytics.originEnableAnalytics = adgAnalytics.enableAnalytics;
@@ -536,7 +559,14 @@ adgAnalytics.disableAnalytics = function () {
   adgAnalytics._oldEnable = enableAnalyticsWrapper;
   // consent 変化時の disable→enable では、基盤の replay が flush 済みウォーターマークより後のイベントしか再送しない。
   // 進行中オークションの track 済みイベント（AUCTION_INIT 等）は再構築できないため、locals（auctions・registry・
-  // 送信待ちの列・タイマー・送信先）は保持する。次の enable で設定は必ず再設定される。
+  // 送信待ちの列・送信先）は保持する。次の enable で設定は必ず再設定される。
+  // ただし disable は同意の撤回などで呼ばれるため、送信は止める（タイマーを外し、離脱時のリスナーや
+  // disable 後に基盤の debounce キューから届くイベントでも送らない）。
+  locals.active = false;
+  if (locals.timer) {
+    clearTimeout(locals.timer);
+    locals.timer = null;
+  }
   adgAnalytics.originDisableAnalytics();
 };
 

@@ -665,6 +665,49 @@ describe('ADG Analytics Adapter', () => {
       expect(event.data.bidders.rubicon.status).to.equal('requested');
     });
 
+    it('does not send pending events while disabled (consent withdrawn)', () => {
+      enable();
+      runAuction();
+      expect(locals.queue).to.have.lengthOf(1);
+
+      // 同意の撤回などで adapterManager.refreshAnalytics が disable する。
+      adgAnalyticsAdapter.disableAnalytics();
+      clock.tick(BATCH_DELAY * 2);
+      window.dispatchEvent(new Event('pagehide'));
+      flush();
+      expect(sendBeaconStub.called).to.be.false;
+      expect(server.requests).to.have.lengthOf(0);
+      // 列は残す（再 enable で送る）。
+      expect(locals.queue).to.have.lengthOf(1);
+    });
+
+    it('does not queue events that reach track after a disable', () => {
+      enable();
+      events.emit(EVENTS.AUCTION_INIT, auctionInit);
+      events.emit(EVENTS.BID_REQUESTED, bidRequested);
+      adgAnalyticsAdapter.disableAnalytics();
+      // 基盤の debounce キューは disable で捨てられないため、disable 後に track が呼ばれうる。
+      adgAnalyticsAdapter.track({ eventType: EVENTS.AUCTION_END, args: { auctionId: AUCTION_ID } });
+      clock.tick(BATCH_DELAY);
+      expect(locals.queue).to.have.lengthOf(0);
+      expect(sendBeaconStub.called).to.be.false;
+    });
+
+    it('sends events kept during a disable after re-enabling', () => {
+      enable();
+      runAuction();
+      adgAnalyticsAdapter.disableAnalytics();
+      clock.tick(BATCH_DELAY * 2);
+      expect(sendBeaconStub.called).to.be.false;
+
+      enable();
+      clock.tick(BATCH_DELAY - 1);
+      expect(sendBeaconStub.called).to.be.false;
+      clock.tick(1);
+      expect(sendBeaconStub.calledOnce).to.be.true;
+      expect(sentEvents()[0].bidId).to.equal(ADG_BID_ID);
+    });
+
     it('keeps the custom enable wrapper after a disable', () => {
       enable({ endpoint: CUSTOM_ENDPOINT });
       adgAnalyticsAdapter.disableAnalytics();
