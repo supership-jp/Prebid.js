@@ -24,6 +24,12 @@ const MAX_BATCH_DELAY = 5000;
 const MAX_BODY_BYTES = 60 * 1024;
 /** 送信割合の判定に使うハッシュの剰余。割合は 0.01% 単位になる。 */
 const SAMPLING_BUCKETS = 10000;
+/** 設定ファイル（送信先・割合・待ち時間）の既定の URL。 */
+const DEFAULT_CONFIG_URL = 'https://i.socdm.com/sdk/prebid/analytics/config-v1.json';
+/** 読める設定ファイルの形式のバージョン。 */
+const CONFIG_VERSION = 1;
+/** 設定ファイルが届くまでためておくイベント数の上限。 */
+const MAX_PENDING_EVENTS = 1000;
 
 const {
   AUCTION_INIT,
@@ -49,11 +55,23 @@ export const locals = {
    * 基盤の enabled は過去イベントの replay が終わってから true になるため、独自に持つ。
    */
   active: false,
-  /** @type {string|null} 送信先。null なら何も送らない */
+  /** @type {string} 設定ファイルの URL */
+  configUrl: DEFAULT_CONFIG_URL,
+  /**
+   * 設定ファイルの状態。none: まだ読んでいない / loading: 読み込み中 / ready: 読めた / failed: 読めない・不正。
+   * ページ（enable）につき 1 回だけ読む。failed のときは何も集めず、何も送らない。
+   * @type {'none'|'loading'|'ready'|'failed'}
+   */
+  configState: 'none',
+  /** @type {Object[]} 設定ファイルが届くまでためておくイベント（{ event, ts }） */
+  pendingEvents: [],
+  /** @type {number|null} 処理中のイベントを受けた時刻。ためておいたイベントを後で処理するときも、受けた時刻を ts に使う */
+  eventTs: null,
+  /** @type {string|null} 送信先（設定ファイルの endpoint）。null なら何も送らない */
   endpoint: null,
-  /** 送る割合（0〜1）。ADG の bid request の bidId のハッシュで判定する */
+  /** 送る割合（0〜1、設定ファイルの ratio）。ADG の bid request の bidId のハッシュで判定する */
   ratio: 0,
-  /** 送信待ちイベントをまとめる待ち時間（ms） */
+  /** 送信待ちイベントをまとめる待ち時間（ms、設定ファイルの batchDelay） */
   batchDelay: DEFAULT_BATCH_DELAY,
   /** @type {Object<string, Object>} auctionId -> AUCTION_END まで蓄積するオークション集約データ */
   auctions: {},
@@ -75,6 +93,10 @@ export const locals = {
   reset() {
     if (this.timer) clearTimeout(this.timer);
     this.active = false;
+    this.configUrl = DEFAULT_CONFIG_URL;
+    this.configState = 'none';
+    this.pendingEvents = [];
+    this.eventTs = null;
     this.endpoint = null;
     this.ratio = 0;
     this.batchDelay = DEFAULT_BATCH_DELAY;
@@ -337,7 +359,7 @@ function onBidViewable(bid) {
 export function buildEvent(type, bidId, auctionId, adUnitCode, data) {
   return {
     type,
-    ts: Date.now(),
+    ts: locals.eventTs != null ? locals.eventTs : Date.now(),
     bidId,
     auctionId,
     adUnitCode,
@@ -490,36 +512,136 @@ function handleEvent({ eventType, args }) {
   }
 }
 
+/**
+ * イベントを処理する。ts はイベントを受けた時刻で、送るイベントの ts になる。
+ */
+function dispatch(event, ts) {
+  locals.eventTs = ts;
+  try {
+    handleEvent(event);
+  } finally {
+    locals.eventTs = null;
+  }
+}
+
+/**
+ * 基盤から呼ばれる受け口。設定ファイルが届くまではためておき、届いたら順に処理する。
+ * 設定ファイルが読めなかったときは何もしない。
+ */
+function track(event) {
+  if (locals.configState === 'loading') {
+    if (locals.pendingEvents.length < MAX_PENDING_EVENTS) {
+      locals.pendingEvents.push({ event, ts: Date.now() });
+    }
+    return;
+  }
+  if (locals.configState !== 'ready') return;
+  dispatch(event, Date.now());
+}
+
 const adgAnalytics = Object.assign(adapter({ analyticsType: 'endpoint' }), {
-  track: handleEvent,
+  track,
 });
 
-function resolveOptions(options) {
-  if (isAllowedEndpoint(options.endpoint)) {
-    locals.endpoint = options.endpoint;
-  } else {
-    if (options.endpoint !== undefined) {
-      logError(`${LOG_PREFIX}endpoint must be https on socdm.com or scaleout.jp, nothing will be sent`, options.endpoint);
-    } else {
-      logWarn(`${LOG_PREFIX}no endpoint, nothing will be sent`);
-    }
-    locals.endpoint = null;
+/**
+ * 設定ファイルの中身を検証して locals に入れる。送れない内容なら false を返す。
+ * テストから検証できるよう export する。
+ */
+export function applyConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object' || cfg.v !== CONFIG_VERSION) {
+    logError(`${LOG_PREFIX}unsupported config version, nothing will be sent`, cfg && cfg.v);
+    return false;
   }
+  if (!isAllowedEndpoint(cfg.endpoint)) {
+    logError(`${LOG_PREFIX}config endpoint must be https on socdm.com or scaleout.jp, nothing will be sent`, cfg.endpoint);
+    return false;
+  }
+  locals.endpoint = cfg.endpoint;
 
-  const ratio = options.ratio;
+  const ratio = cfg.ratio;
   if (typeof ratio === 'number' && ratio >= 0 && ratio <= 1) {
     locals.ratio = ratio;
   } else {
-    if (ratio !== undefined) logError(`${LOG_PREFIX}ratio must be a number between 0 and 1, using 0`, ratio);
+    logError(`${LOG_PREFIX}config ratio must be a number between 0 and 1, using 0`, ratio);
     locals.ratio = 0;
   }
 
-  const delay = options.batchDelay;
+  const delay = cfg.batchDelay;
   if (typeof delay === 'number' && delay >= 0 && delay <= MAX_BATCH_DELAY) {
     locals.batchDelay = delay;
   } else {
-    if (delay !== undefined) logError(`${LOG_PREFIX}batchDelay must be 0-${MAX_BATCH_DELAY} ms, using ${DEFAULT_BATCH_DELAY}`, delay);
+    if (delay !== undefined) logError(`${LOG_PREFIX}config batchDelay must be 0-${MAX_BATCH_DELAY} ms, using ${DEFAULT_BATCH_DELAY}`, delay);
     locals.batchDelay = DEFAULT_BATCH_DELAY;
+  }
+  return true;
+}
+
+function configLoaded(responseText) {
+  let cfg = null;
+  try {
+    cfg = JSON.parse(responseText);
+  } catch (e) {
+    logError(`${LOG_PREFIX}config is not valid JSON, nothing will be sent`, locals.configUrl);
+  }
+  if (!cfg || !applyConfig(cfg)) {
+    configFailed();
+    return;
+  }
+  locals.configState = 'ready';
+  logInfo(`${LOG_PREFIX}config loaded`, cfg);
+  // 届くまでにためたイベントを、受けた時刻のまま順に処理する。
+  const pending = locals.pendingEvents;
+  locals.pendingEvents = [];
+  pending.forEach(({ event, ts }) => dispatch(event, ts));
+}
+
+function configFailed() {
+  locals.configState = 'failed';
+  locals.pendingEvents = [];
+  locals.endpoint = null;
+}
+
+/**
+ * 設定ファイルを読む（ページにつき 1 回）。Cookie は付けない。
+ * 読めない・中身が不正・タイムアウト（3 秒）なら、そのページでは何も送らない。
+ */
+function loadConfig(url) {
+  locals.configState = 'loading';
+  ajax(url, {
+    success: configLoaded,
+    error(statusText) {
+      logError(`${LOG_PREFIX}could not load config, nothing will be sent`, url, statusText);
+      configFailed();
+    },
+  }, null, { method: 'GET' });
+}
+
+/**
+ * 設定ファイルの URL を検証する（https のみ）。テストから検証できるよう export する。
+ */
+export function isValidConfigUrl(value) {
+  if (typeof value !== 'string' || !value) return false;
+  try {
+    return new URL(value).protocol === 'https:';
+  } catch (e) {
+    return false;
+  }
+}
+
+function resolveOptions(options) {
+  ['endpoint', 'ratio', 'batchDelay'].forEach((key) => {
+    if (options[key] !== undefined) {
+      // 送信先・割合・待ち時間は設定ファイルで配る。検証用に差し替えるときは configUrl を使う。
+      logWarn(`${LOG_PREFIX}options.${key} is ignored, it comes from the config file (options.configUrl)`);
+    }
+  });
+  if (options.configUrl === undefined) {
+    locals.configUrl = DEFAULT_CONFIG_URL;
+  } else if (isValidConfigUrl(options.configUrl)) {
+    locals.configUrl = options.configUrl;
+  } else {
+    logError(`${LOG_PREFIX}configUrl must be an https URL, nothing will be sent`, options.configUrl);
+    locals.configUrl = null;
   }
 }
 
@@ -528,12 +650,20 @@ function resolveOptions(options) {
  */
 function enableAnalyticsWrapper(config) {
   const options = (config && config.options) || {};
-  resolveOptions(options);
   locals.active = true;
+  // 設定ファイルはページにつき 1 回だけ読む（同意の変化による disable→enable では読み直さない）。
+  if (locals.configState === 'none') {
+    resolveOptions(options);
+    if (locals.configUrl) {
+      loadConfig(locals.configUrl);
+    } else {
+      configFailed();
+    }
+  }
   let baseConfig = config;
   if (options.sampling !== undefined) {
     // 基盤の options.sampling はセッション単位の抽選で、bidId による判定と二重になり受信側で再現できない。
-    logWarn(`${LOG_PREFIX}options.sampling is ignored, use options.ratio`);
+    logWarn(`${LOG_PREFIX}options.sampling is ignored, the ratio comes from the config file`);
     const { sampling, ...rest } = options;
     baseConfig = { ...config, options: rest };
   }
@@ -559,7 +689,7 @@ adgAnalytics.disableAnalytics = function () {
   adgAnalytics._oldEnable = enableAnalyticsWrapper;
   // consent 変化時の disable→enable では、基盤の replay が flush 済みウォーターマークより後のイベントしか再送しない。
   // 進行中オークションの track 済みイベント（AUCTION_INIT 等）は再構築できないため、locals（auctions・registry・
-  // 送信待ちの列・送信先）は保持する。次の enable で設定は必ず再設定される。
+  // 送信待ちの列・設定ファイルの内容）は保持する。
   // ただし disable は同意の撤回などで呼ばれるため、送信は止める（タイマーを外し、離脱時のリスナーでも送らない）。
   // 基盤は disable で debounce の列を捨てるが、disable 後に track が呼ばれた場合に備えて enqueue でも止める。
   locals.active = false;

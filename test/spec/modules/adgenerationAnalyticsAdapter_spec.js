@@ -9,6 +9,7 @@ import adgAnalyticsAdapter, {
   fnv1a32,
   isSampled,
   isAllowedEndpoint,
+  isValidConfigUrl,
   buildEnvelope,
   flush,
 } from '../../../modules/adgenerationAnalyticsAdapter.js';
@@ -21,6 +22,8 @@ import { server } from '../../mocks/xhr.js';
 const PROVIDER_CODE = 'adgeneration';
 const ENDPOINT = 'https://d.socdm.com/adgen/analytics';
 const CUSTOM_ENDPOINT = 'https://api-test.scaleout.jp/adgen/analytics';
+const CONFIG_URL = 'https://config.example.com/prebid/analytics/config-v1.json';
+const DEFAULT_CONFIG_URL = 'https://i.socdm.com/sdk/prebid/analytics/config-v1.json';
 
 // テスト環境では基盤の track の debounce が 0 のため（test/mocks/analyticsStub.js）、イベントは同期で処理される。
 const BATCH_DELAY = 1000;
@@ -79,11 +82,32 @@ describe('ADG Analytics Adapter', () => {
   let clock;
   let sendBeaconStub;
 
-  function enable(options = {}) {
+  /** 設定ファイルへのリクエスト（最後のもの）。 */
+  function configRequest(url = CONFIG_URL) {
+    return server.requests.filter((r) => r.url === url).pop();
+  }
+
+  /** 設定ファイルを返す。既定は送信先 ENDPOINT・全部送る。 */
+  function respondConfig(config = {}) {
+    configRequest().respond(200, { 'Content-Type': 'application/json' },
+      JSON.stringify({ v: 1, endpoint: ENDPOINT, ratio: 1, ...config }));
+  }
+
+  /** 送信先へのリクエスト（ajax にフォールバックしたもの）。 */
+  function endpointRequests() {
+    return server.requests.filter((r) => r.url === ENDPOINT);
+  }
+
+  /**
+   * テスト用の設定ファイルを指して有効化し、読み込み中なら設定ファイルを返す。
+   * 設定ファイルはページにつき 1 回しか読まないので、再 enable では返さない。
+   */
+  function enable(config = {}, options = {}) {
     adgAnalyticsAdapter.enableAnalytics({
       provider: PROVIDER_CODE,
-      options: { endpoint: ENDPOINT, ratio: 1, ...options },
+      options: { configUrl: CONFIG_URL, ...options },
     });
+    if (locals.configState === 'loading') respondConfig(config);
   }
 
   /** 送られた本文を古い順に返す。 */
@@ -133,48 +157,112 @@ describe('ADG Analytics Adapter', () => {
       expect(adapter.adapter).to.equal(adgAnalyticsAdapter);
     });
 
-    it('accepts an https endpoint on an allowed domain', () => {
-      enable({ endpoint: CUSTOM_ENDPOINT });
-      expect(locals.endpoint).to.equal(CUSTOM_ENDPOINT);
+    it('loads the production config file by default', () => {
+      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: {} });
+      const req = configRequest(DEFAULT_CONFIG_URL);
+      expect(req).to.exist;
+      expect(req.method).to.equal('GET');
+      expect(locals.configState).to.equal('loading');
     });
 
-    it('sends nothing when no endpoint is configured', () => {
-      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: { ratio: 1 } });
-      expect(locals.endpoint).to.be.null;
+    it('reads the endpoint, ratio and batchDelay from the config file', () => {
+      enable({ endpoint: CUSTOM_ENDPOINT, ratio: 0.5, batchDelay: 3000 });
+      expect(locals.configState).to.equal('ready');
+      expect(locals.endpoint).to.equal(CUSTOM_ENDPOINT);
+      expect(locals.ratio).to.equal(0.5);
+      expect(locals.batchDelay).to.equal(3000);
+    });
+
+    it('sends nothing when the config endpoint is not https on an allowed domain', () => {
+      ['http://d.socdm.com/adgen/analytics', 'https://example.com/analytics', 'https://socdm.com.evil.com/a', 'not-a-url', undefined]
+        .forEach((endpoint) => {
+          adgAnalyticsAdapter.disableAnalytics();
+          locals.reset();
+          enable({ endpoint });
+          expect(locals.configState, String(endpoint)).to.equal('failed');
+          expect(locals.endpoint, String(endpoint)).to.be.null;
+        });
       runAuction();
       clock.tick(BATCH_DELAY);
       expect(sendBeaconStub.called).to.be.false;
+      expect(endpointRequests()).to.have.lengthOf(0);
+    });
+
+    it('sends nothing for an unsupported config version', () => {
+      enable({ v: 2 });
+      expect(locals.configState).to.equal('failed');
+      runAuction();
+      clock.tick(BATCH_DELAY);
+      expect(sendBeaconStub.called).to.be.false;
+    });
+
+    it('sends nothing when the config is not JSON', () => {
+      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: { configUrl: CONFIG_URL } });
+      configRequest().respond(200, {}, 'not json');
+      expect(locals.configState).to.equal('failed');
+      runAuction();
+      clock.tick(BATCH_DELAY);
+      expect(sendBeaconStub.called).to.be.false;
+    });
+
+    it('sends nothing when the config cannot be loaded, and drops the events held for it', () => {
+      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: { configUrl: CONFIG_URL } });
+      runAuction();
+      expect(locals.pendingEvents).to.not.be.empty;
+      configRequest().respond(404, {}, 'Not Found');
+      expect(locals.configState).to.equal('failed');
+      expect(locals.pendingEvents).to.be.empty;
+      runAuction();
+      clock.tick(BATCH_DELAY);
+      expect(sendBeaconStub.called).to.be.false;
+    });
+
+    it('does not load a configUrl that is not https', () => {
+      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: { configUrl: 'http://config.example.com/c.json' } });
       expect(server.requests).to.have.lengthOf(0);
+      expect(locals.configState).to.equal('failed');
     });
 
-    it('rejects endpoints that are not https or not on an allowed domain', () => {
-      ['http://d.socdm.com/adgen/analytics', 'https://example.com/analytics', 'https://socdm.com.evil.com/a', 'not-a-url']
-        .forEach((endpoint) => {
-          enable({ endpoint });
-          expect(locals.endpoint, endpoint).to.be.null;
-          adgAnalyticsAdapter.disableAnalytics();
-        });
-    });
-
-    it('defaults ratio to 0 and batchDelay to 1000', () => {
-      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: { endpoint: ENDPOINT } });
-      expect(locals.ratio).to.equal(0);
-      expect(locals.batchDelay).to.equal(1000);
-    });
-
-    it('falls back to defaults for out-of-range ratio / batchDelay', () => {
+    it('treats an invalid ratio as 0 and an invalid batchDelay as 1000', () => {
       enable({ ratio: 1.5, batchDelay: 6000 });
       expect(locals.ratio).to.equal(0);
       expect(locals.batchDelay).to.equal(1000);
       adgAnalyticsAdapter.disableAnalytics();
+      locals.reset();
       enable({ ratio: '0.5', batchDelay: -1 });
+      expect(locals.ratio).to.equal(0);
+      expect(locals.batchDelay).to.equal(1000);
+      adgAnalyticsAdapter.disableAnalytics();
+      locals.reset();
+      enable({ ratio: undefined, batchDelay: undefined });
       expect(locals.ratio).to.equal(0);
       expect(locals.batchDelay).to.equal(1000);
     });
 
+    it('ignores endpoint / ratio / batchDelay given in options', () => {
+      enable({}, { endpoint: CUSTOM_ENDPOINT, ratio: 0, batchDelay: 0 });
+      expect(locals.endpoint).to.equal(ENDPOINT);
+      expect(locals.ratio).to.equal(1);
+      expect(locals.batchDelay).to.equal(1000);
+    });
+
+    it('holds events until the config arrives and keeps the time they were received', () => {
+      adgAnalyticsAdapter.enableAnalytics({ provider: PROVIDER_CODE, options: { configUrl: CONFIG_URL } });
+      const startedAt = Date.now();
+      runAuction();
+      clock.tick(500);
+      expect(sendBeaconStub.called).to.be.false;
+      respondConfig();
+      clock.tick(BATCH_DELAY);
+      const [event] = sentEvents();
+      expect(event.type).to.equal('auctionEnd');
+      expect(event.bidId).to.equal(ADG_BID_ID);
+      expect(event.ts).to.equal(startedAt);
+    });
+
     it('does not pass options.sampling to the analytics base (session sampling)', () => {
       const randomStub = sandbox.stub(Math, 'random').returns(0.99);
-      enable({ sampling: 0.01 });
+      enable({}, { sampling: 0.01 });
       randomStub.restore();
       runAuction();
       clock.tick(BATCH_DELAY);
@@ -189,6 +277,13 @@ describe('ADG Analytics Adapter', () => {
       expect(isAllowedEndpoint('https://notsocdm.com/a')).to.be.false;
       expect(isAllowedEndpoint('http://d.socdm.com/a')).to.be.false;
       expect(isAllowedEndpoint(undefined)).to.be.false;
+    });
+
+    it('validates config URLs with isValidConfigUrl', () => {
+      expect(isValidConfigUrl(DEFAULT_CONFIG_URL)).to.be.true;
+      expect(isValidConfigUrl('https://pub-temp.s3.ap-northeast-1.amazonaws.com/c.json')).to.be.true;
+      expect(isValidConfigUrl('http://i.socdm.com/c.json')).to.be.false;
+      expect(isValidConfigUrl('')).to.be.false;
     });
   });
 
@@ -608,10 +703,9 @@ describe('ADG Analytics Adapter', () => {
       runAuction();
       clock.tick(BATCH_DELAY);
 
-      expect(server.requests.length).to.equal(1);
-      expect(server.requests[0].url).to.equal(ENDPOINT);
-      expect(server.requests[0].method).to.equal('POST');
-      const payload = JSON.parse(server.requests[0].requestBody);
+      expect(endpointRequests()).to.have.lengthOf(1);
+      expect(endpointRequests()[0].method).to.equal('POST');
+      const payload = JSON.parse(endpointRequests()[0].requestBody);
       expect(payload.events[0].type).to.equal('auctionEnd');
     });
   });
@@ -676,7 +770,7 @@ describe('ADG Analytics Adapter', () => {
       window.dispatchEvent(new Event('pagehide'));
       flush();
       expect(sendBeaconStub.called).to.be.false;
-      expect(server.requests).to.have.lengthOf(0);
+      expect(endpointRequests()).to.have.lengthOf(0);
       // 列は残す（再 enable で送る）。
       expect(locals.queue).to.have.lengthOf(1);
     });
@@ -708,15 +802,17 @@ describe('ADG Analytics Adapter', () => {
       expect(sentEvents()[0].bidId).to.equal(ADG_BID_ID);
     });
 
-    it('keeps the custom enable wrapper after a disable', () => {
+    it('keeps the custom enable wrapper and the loaded config after a disable', () => {
       enable({ endpoint: CUSTOM_ENDPOINT });
       adgAnalyticsAdapter.disableAnalytics();
+      expect(locals.active).to.be.false;
       expect(locals.endpoint).to.equal(CUSTOM_ENDPOINT);
 
-      // ラッパーが失われていなければ、再 enable で設定が再設定される。
-      enable({ endpoint: ENDPOINT, ratio: 0.5 });
-      expect(locals.endpoint).to.equal(ENDPOINT);
-      expect(locals.ratio).to.equal(0.5);
+      // ラッパーが失われていなければ、再 enable で active に戻る。設定ファイルは読み直さない。
+      enable();
+      expect(locals.active).to.be.true;
+      expect(locals.endpoint).to.equal(CUSTOM_ENDPOINT);
+      expect(server.requests.filter((r) => r.url === CONFIG_URL)).to.have.lengthOf(1);
     });
   });
 });

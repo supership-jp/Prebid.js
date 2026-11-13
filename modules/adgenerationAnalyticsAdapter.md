@@ -15,8 +15,9 @@ status of every bidder (cpm / currency / response time / media type / size), so
 AdGeneration can compare its results with the other bidders.
 
 Which ad units are sent is decided per AdGeneration bid request, by hashing its
-`bidId` (see [Sampling](#sampling)). Nothing is sent unless both `endpoint` and
-`ratio` are configured.
+`bidId` (see [Sampling](#sampling)). The endpoint, the ratio and the batch
+delay come from a config file that AdGeneration serves (see
+[Config file](#config-file)), so they can be changed without touching the page.
 
 #### Events
 
@@ -66,7 +67,8 @@ units that were sent on `AUCTION_END`, for the latest 50 auctions.
 
 Events are queued and sent together:
 
-- The first queued event starts a timer of `batchDelay` ms (1000 by default).
+- The first queued event starts a timer of `batchDelay` ms (from the config
+  file, 1000 by default).
   When it fires, every queued event is sent in one request. Later events do not
   extend the wait; the next event after sending starts a new timer.
 - If adding an event would make the body larger than 60KB, the queued events are
@@ -118,13 +120,43 @@ collect viewability data, include and enable one of the viewability modules:
 pbjs.setConfig({ bidViewabilityIO: { enabled: true } });
 ```
 
+#### Config file
+
+When analytics is enabled, the adapter loads a config file once per page
+(GET, without credentials, 3 second timeout). By default it is
+`https://i.socdm.com/sdk/prebid/analytics/config-v1.json`.
+
+```json
+{
+  "v": 1,
+  "endpoint": "https://d.socdm.com/adgen/analytics",
+  "ratio": 0.1,
+  "batchDelay": 1000
+}
+```
+
+| Field        | Type     | Description |
+|--------------|----------|-------------|
+| `v`          | `number` | Format version. Only `1` is supported; any other value sends nothing. |
+| `endpoint`   | `string` | Endpoint that receives the events. Must be `https` on `socdm.com` or `scaleout.jp` (or their subdomains); otherwise nothing is sent. |
+| `ratio`      | `number` | Ratio of AdGeneration bid requests to send, between `0` and `1`. An invalid value is treated as `0` (nothing is sent). |
+| `batchDelay` | `number` | Time in ms to wait from the first queued event before sending, between `0` and `5000`. Defaults to `1000`. `0` sends every event immediately. |
+
+- Events that arrive before the config file are held (up to 1000) and
+  processed when it arrives, keeping the time they were received.
+- If the config file cannot be loaded, is not valid JSON or has an invalid
+  `v` / `endpoint`, nothing is sent on that page.
+- The config file is not loaded again when analytics is disabled and enabled
+  again (for example when consent changes).
+
 #### Analytics Options
 
-| Name         | Scope    | Example                               | Type     | Description |
-|--------------|----------|---------------------------------------|----------|-------------|
-| `endpoint`   | required | `https://d.socdm.com/adgen/analytics` | `string` | Endpoint that receives the events. Must be `https` on `socdm.com` or `scaleout.jp` (or their subdomains). Nothing is sent without it. |
-| `ratio`      | required | `0.1`                                 | `number` | Ratio of AdGeneration bid requests to send, between `0` and `1`. Defaults to `0` (nothing is sent). |
-| `batchDelay` | optional | `1000`                                | `number` | Time in ms to wait from the first queued event before sending, between `0` and `5000`. Defaults to `1000`. `0` sends every event immediately. |
+| Name        | Scope    | Example                                                   | Type     | Description |
+|-------------|----------|-----------------------------------------------------------|----------|-------------|
+| `configUrl` | optional | `https://i.socdm.com/sdk/prebid/analytics/config-v1.json` | `string` | URL of the config file. Must be `https`. Set it only to point at a test config file. |
+
+`endpoint`, `ratio` and `batchDelay` are not read from the options; they come
+from the config file.
 
 #### Build
 
@@ -136,14 +168,17 @@ gulp build --modules=adgenerationBidAdapter,adgenerationAnalyticsAdapter,bidView
 
 ```js
 pbjs.enableAnalytics({
+    provider: 'adgeneration'
+});
+```
+
+With a test config file:
+
+```js
+pbjs.enableAnalytics({
     provider: 'adgeneration',
     options: {
-        endpoint: 'https://d.socdm.com/adgen/analytics',
-        ratio: 0.1,
-        /**
-         * [optional] Defaults to 1000.
-         */
-        batchDelay: 1000
+        configUrl: 'https://example.com/test/config-v1.json'
     }
 });
 ```
