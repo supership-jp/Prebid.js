@@ -278,6 +278,9 @@ describe('ADG Analytics Adapter', () => {
       expect(isAllowedEndpoint('https://x.scaleout.jp/a')).to.be.true;
       expect(isAllowedEndpoint('https://rtb-pub.dev.ad-generation.jp/pbanalytics/v1')).to.be.true;
       expect(isAllowedEndpoint('https://evil-ad-generation.jp/a')).to.be.false;
+      expect(isAllowedEndpoint('https://notsocdm.com/a')).to.be.false;
+      expect(isAllowedEndpoint('http://d.socdm.com/a')).to.be.false;
+      expect(isAllowedEndpoint(undefined)).to.be.false;
     });
 
     it('adds the send time as t to the endpoint, keeping its query', () => {
@@ -285,9 +288,6 @@ describe('ADG Analytics Adapter', () => {
         .to.equal('https://rtb.socdm.com/pbanalytics/v1?t=1700000000123');
       expect(buildSendUrl('https://rtb.socdm.com/pbanalytics/v1?x=1', 5))
         .to.equal('https://rtb.socdm.com/pbanalytics/v1?x=1&t=5');
-      expect(isAllowedEndpoint('https://notsocdm.com/a')).to.be.false;
-      expect(isAllowedEndpoint('http://d.socdm.com/a')).to.be.false;
-      expect(isAllowedEndpoint(undefined)).to.be.false;
     });
 
     it('validates config URLs with isValidConfigUrl', () => {
