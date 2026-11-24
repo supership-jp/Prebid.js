@@ -14,7 +14,7 @@ const ANALYTICS_VERSION = '2.0.0';
 /** 送信本文の形式のバージョン。 */
 const PAYLOAD_VERSION = 1;
 /** 送信先として受理するドメイン（完全一致またはサブドメイン）。 */
-const ALLOWED_ENDPOINT_DOMAINS = ['socdm.com', 'scaleout.jp'];
+const ALLOWED_ENDPOINT_DOMAINS = ['socdm.com', 'scaleout.jp', 'ad-generation.jp'];
 /** オークション後のイベント判定用に保持する auction 数の上限（超えたら古いものから破棄）。 */
 const REGISTRY_MAX_AUCTIONS = 50;
 /** 送信待ちイベントをまとめる待ち時間（ms）の既定値と上限。 */
@@ -77,7 +77,7 @@ export const locals = {
   auctions: {},
   /**
    * AUCTION_END 後もオークション後のイベントを判定するための送信対象枠の記録。
-   * auctionId -> { units: { adUnitCode -> ADG の bidId[] }, adIds: { adId -> adUnitCode } }
+   * auctionId -> { units: { adUnitCode -> { bidId, locationId }[] }, adIds: { adId -> adUnitCode } }
    * 挿入順に REGISTRY_MAX_AUCTIONS 件まで保持する。
    * @type {Object<string, Object>}
    */
@@ -171,9 +171,9 @@ function registerTargets(auctionId, units, adIds) {
 }
 
 /**
- * オークション後のイベントの対象枠なら、その枠の ADG の bidId の配列を返す（対象外は undefined）。
+ * オークション後のイベントの対象枠なら、その枠の ADG の bid request（{ bidId, locationId }）の配列を返す（対象外は undefined）。
  */
-function lookupTargetBidIds(auctionId, adUnitCode) {
+function lookupTargets(auctionId, adUnitCode) {
   const entry = locals.registry[auctionId];
   return entry && entry.units[adUnitCode];
 }
@@ -228,8 +228,17 @@ function onAuctionInit({ auctionId, timestamp }) {
     auctionId,
     timestamp,
     adUnits: {}, // adUnitCode -> { bidders: { [bidder]: {...} } }
-    targets: {}, // adUnitCode -> 送信対象に当たった ADG の bidId[]
+    targets: {}, // adUnitCode -> 送信対象に当たった ADG の bid request（{ bidId, locationId }）[]
   };
+}
+
+/**
+ * ADG の広告枠 ID（媒体が bidder の設定に書く params.id）。受信側が枠・媒体ごとに集計するために各イベントに入れる。
+ * ADG のリクエストは adUnit ごとに分かれるので、bidId と 1 対 1 になる。
+ */
+function getLocationId(bid) {
+  const id = bid.params && bid.params.id;
+  return id === undefined || id === null || id === '' ? null : String(id);
 }
 
 function onBidRequested({ auctionId, bids = [] }) {
@@ -241,8 +250,10 @@ function onBidRequested({ auctionId, bids = [] }) {
     // bidId は ADG へのリクエストの imp.id と同じ値で、timeout の枠でも取れる。
     if (isAdgBidder(bid.bidder) && isSampled(bid.bidId, locals.ratio)) {
       const targets = locals.auctions[auctionId].targets;
-      const ids = (targets[bid.adUnitCode] = targets[bid.adUnitCode] || []);
-      if (!ids.includes(bid.bidId)) ids.push(bid.bidId);
+      const list = (targets[bid.adUnitCode] = targets[bid.adUnitCode] || []);
+      if (!list.some((t) => t.bidId === bid.bidId)) {
+        list.push({ bidId: bid.bidId, locationId: getLocationId(bid) });
+      }
     }
   });
 }
@@ -299,16 +310,16 @@ function onAuctionEnd({ auctionId }) {
   const units = {};
   const adIds = {};
   codes.forEach((code) => {
-    const bidIds = auction.targets[code];
-    units[code] = bidIds;
+    const targets = auction.targets[code];
+    units[code] = targets;
     const bidders = auction.adUnits[code].bidders;
     Object.keys(bidders).forEach((bidder) => {
       (bidders[bidder].bids || []).forEach(({ adId }) => {
         if (adId) adIds[adId] = code;
       });
     });
-    bidIds.forEach((bidId) => {
-      enqueue(buildEvent('auctionEnd', bidId, auctionId, code, { bidders }));
+    targets.forEach((target) => {
+      enqueue(buildEvent('auctionEnd', target, auctionId, code, { bidders }));
     });
   });
   registerTargets(auctionId, units, adIds);
@@ -318,9 +329,9 @@ function onAuctionEnd({ auctionId }) {
  * オークション後のイベントを、対象枠の ADG の bidId ごとに積む（対象外の枠は何もしない）。
  */
 function enqueueFollowUp(type, auctionId, adUnitCode, data) {
-  const bidIds = lookupTargetBidIds(auctionId, adUnitCode);
-  if (!bidIds) return;
-  bidIds.forEach((bidId) => enqueue(buildEvent(type, bidId, auctionId, adUnitCode, data)));
+  const targets = lookupTargets(auctionId, adUnitCode);
+  if (!targets) return;
+  targets.forEach((target) => enqueue(buildEvent(type, target, auctionId, adUnitCode, data)));
 }
 
 function onBidWon(bid) {
@@ -355,15 +366,19 @@ function onBidViewable(bid) {
 
 /**
  * 送信本文の events 配列に入れる 1 件を作る。テストから検証できるよう export する。
+ * 種類ごとの中身は種類名のキー（例: auctionEnd: {...}）に入れる。受信側が種類ごとの型でそのまま読めるようにするため。
+ * @param {string} type イベントの種類（auctionEnd / bidWon / adRenderFailed / viewable）
+ * @param {{bidId: string, locationId: (string|null)}} target 送信対象の ADG の bid request
  */
-export function buildEvent(type, bidId, auctionId, adUnitCode, data) {
+export function buildEvent(type, target, auctionId, adUnitCode, payload) {
   return {
     type,
     ts: locals.eventTs != null ? locals.eventTs : Date.now(),
-    bidId,
+    bidId: target.bidId,
+    locationId: target.locationId,
     auctionId,
     adUnitCode,
-    data,
+    [type]: payload,
   };
 }
 
@@ -446,16 +461,27 @@ export function flush() {
 }
 
 /**
+ * 送信 URL に送信時刻（ms）の t を付ける。固定の URL への機械的なアクセスを受信側で捨てやすくするため。
+ * テストから検証できるよう export する。
+ */
+export function buildSendUrl(endpoint, now = Date.now()) {
+  const url = new URL(endpoint);
+  url.searchParams.set('t', String(now));
+  return url.toString();
+}
+
+/**
  * ページ遷移後も欠損しにくい sendBeacon を優先し、利用不可なら ajax にフォールバックする。
  * Content-Type は preflight(OPTIONS) を避けるため text/plain とする（サーバー側で JSON パースする）。
  */
 function send(payload) {
   const body = JSON.stringify(payload);
-  if (sendBeacon(locals.endpoint, body)) {
+  const url = buildSendUrl(locals.endpoint);
+  if (sendBeacon(url, body)) {
     logInfo(`${LOG_PREFIX}report sent`, payload);
     return;
   }
-  ajax(locals.endpoint, null, body, {
+  ajax(url, null, body, {
     contentType: 'text/plain',
     method: 'POST',
     keepalive: true,
@@ -553,7 +579,7 @@ export function applyConfig(cfg) {
     return false;
   }
   if (!isAllowedEndpoint(cfg.endpoint)) {
-    logError(`${LOG_PREFIX}config endpoint must be https on socdm.com or scaleout.jp, nothing will be sent`, cfg.endpoint);
+    logError(`${LOG_PREFIX}config endpoint must be https on socdm.com, scaleout.jp or ad-generation.jp, nothing will be sent`, cfg.endpoint);
     return false;
   }
   locals.endpoint = cfg.endpoint;

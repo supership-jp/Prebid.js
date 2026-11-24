@@ -11,6 +11,7 @@ import adgAnalyticsAdapter, {
   isAllowedEndpoint,
   isValidConfigUrl,
   buildEnvelope,
+  buildSendUrl,
   flush,
 } from '../../../modules/adgenerationAnalyticsAdapter.js';
 import { expect } from 'chai';
@@ -34,6 +35,7 @@ const AD_UNIT_CODE_2 = 'div-gpt-ad-2';
 const AD_ID = 'test-ad-id-1';
 const ADG_BID_ID = 'adg-bid-1';
 const ADG_BID_ID_2 = 'adg-bid-2';
+const ADG_LOCATION_ID = '58278';
 
 const auctionInit = {
   auctionId: AUCTION_ID,
@@ -43,8 +45,8 @@ const auctionInit = {
 const bidRequested = {
   auctionId: AUCTION_ID,
   bids: [
-    { adUnitCode: AD_UNIT_CODE, bidder: 'adgeneration', bidId: ADG_BID_ID },
-    { adUnitCode: AD_UNIT_CODE, bidder: 'rubicon', bidId: 'rubicon-bid-1' },
+    { adUnitCode: AD_UNIT_CODE, bidder: 'adgeneration', bidId: ADG_BID_ID, params: { id: ADG_LOCATION_ID } },
+    { adUnitCode: AD_UNIT_CODE, bidder: 'rubicon', bidId: 'rubicon-bid-1', params: { accountId: 1 } },
   ],
 };
 
@@ -93,9 +95,9 @@ describe('ADG Analytics Adapter', () => {
       JSON.stringify({ v: 1, endpoint: ENDPOINT, ratio: 1, ...config }));
   }
 
-  /** 送信先へのリクエスト（ajax にフォールバックしたもの）。 */
+  /** 送信先へのリクエスト（ajax にフォールバックしたもの）。URL には送信時刻の t が付く。 */
   function endpointRequests() {
-    return server.requests.filter((r) => r.url === ENDPOINT);
+    return server.requests.filter((r) => r.url.startsWith(`${ENDPOINT}?t=`));
   }
 
   /**
@@ -274,6 +276,15 @@ describe('ADG Analytics Adapter', () => {
       expect(isAllowedEndpoint('https://socdm.com/a')).to.be.true;
       expect(isAllowedEndpoint('https://d.socdm.com/a')).to.be.true;
       expect(isAllowedEndpoint('https://x.scaleout.jp/a')).to.be.true;
+      expect(isAllowedEndpoint('https://rtb-pub.dev.ad-generation.jp/pbanalytics/v1')).to.be.true;
+      expect(isAllowedEndpoint('https://evil-ad-generation.jp/a')).to.be.false;
+    });
+
+    it('adds the send time as t to the endpoint, keeping its query', () => {
+      expect(buildSendUrl('https://rtb.socdm.com/pbanalytics/v1', 1700000000123))
+        .to.equal('https://rtb.socdm.com/pbanalytics/v1?t=1700000000123');
+      expect(buildSendUrl('https://rtb.socdm.com/pbanalytics/v1?x=1', 5))
+        .to.equal('https://rtb.socdm.com/pbanalytics/v1?x=1&t=5');
       expect(isAllowedEndpoint('https://notsocdm.com/a')).to.be.false;
       expect(isAllowedEndpoint('http://d.socdm.com/a')).to.be.false;
       expect(isAllowedEndpoint(undefined)).to.be.false;
@@ -352,7 +363,26 @@ describe('ADG Analytics Adapter', () => {
       const sent = sentEvents();
       expect(sent).to.have.lengthOf(1);
       expect(sent[0].bidId).to.equal(ADG_BID_ID);
-      expect(sent[0].data.bidders.adg.status).to.equal('requested');
+      // params.id が無ければ locationId は null。
+      expect(sent[0].locationId).to.be.null;
+      expect(sent[0].auctionEnd.bidders.adg.status).to.equal('requested');
+    });
+
+    it('sends the ADG location id from params.id as a string, per bidId', () => {
+      enable();
+      events.emit(EVENTS.AUCTION_INIT, auctionInit);
+      events.emit(EVENTS.BID_REQUESTED, {
+        auctionId: AUCTION_ID,
+        bids: [
+          { adUnitCode: AD_UNIT_CODE, bidder: 'adgeneration', bidId: ADG_BID_ID, params: { id: 58278 } },
+          { adUnitCode: AD_UNIT_CODE_2, bidder: 'adgeneration', bidId: ADG_BID_ID_2, params: { id: '110569' } },
+        ],
+      });
+      events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
+      clock.tick(BATCH_DELAY);
+
+      const byBidId = Object.fromEntries(sentEvents().map((e) => [e.bidId, e.locationId]));
+      expect(byBidId).to.deep.equal({ [ADG_BID_ID]: '58278', [ADG_BID_ID_2]: '110569' });
     });
   });
 
@@ -367,7 +397,7 @@ describe('ADG Analytics Adapter', () => {
 
       expect(sendBeaconStub.calledOnce).to.be.true;
       const [url, body] = sendBeaconStub.getCall(0).args;
-      expect(url).to.equal(ENDPOINT);
+      expect(url).to.equal(`${ENDPOINT}?t=${Date.now()}`);
 
       const payload = JSON.parse(body);
       expect(payload.v).to.equal(1);
@@ -381,8 +411,11 @@ describe('ADG Analytics Adapter', () => {
       expect(event.bidId).to.equal(ADG_BID_ID);
       expect(event.auctionId).to.equal(AUCTION_ID);
       expect(event.adUnitCode).to.equal(AD_UNIT_CODE);
+      expect(event.locationId).to.equal(ADG_LOCATION_ID);
       expect(event.ts).to.be.a('number');
-      const bidders = event.data.bidders;
+      // 種類ごとの中身は種類名のキーに入れる（data は使わない）。
+      expect(event).to.not.have.property('data');
+      const bidders = event.auctionEnd.bidders;
       expect(bidders.adgeneration.status).to.equal('bid');
       expect(bidders.adgeneration.bids).to.have.lengthOf(1);
       expect(bidders.adgeneration.bids[0].adId).to.equal(AD_ID);
@@ -401,7 +434,7 @@ describe('ADG Analytics Adapter', () => {
 
       const [event] = sentEvents();
       expect(event.bidId).to.equal(ADG_BID_ID);
-      expect(event.data.bidders.adgeneration.status).to.equal('timeout');
+      expect(event.auctionEnd.bidders.adgeneration.status).to.equal('timeout');
     });
 
     it('records timeout status when BID_TIMEOUT args are object-shaped (analyticsLabels)', () => {
@@ -414,7 +447,7 @@ describe('ADG Analytics Adapter', () => {
       events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
       clock.tick(BATCH_DELAY);
 
-      expect(sentEvents()[0].data.bidders.rubicon.status).to.equal('timeout');
+      expect(sentEvents()[0].auctionEnd.bidders.rubicon.status).to.equal('timeout');
     });
 
     it('records rejected status and reason on BID_REJECTED', () => {
@@ -427,7 +460,7 @@ describe('ADG Analytics Adapter', () => {
       events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
       clock.tick(BATCH_DELAY);
 
-      const adg = sentEvents()[0].data.bidders.adgeneration;
+      const adg = sentEvents()[0].auctionEnd.bidders.adgeneration;
       expect(adg.status).to.equal('rejected');
       expect(adg.rejectedBids[0].reason).to.equal('Bid does not meet price floor');
     });
@@ -443,7 +476,7 @@ describe('ADG Analytics Adapter', () => {
       events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
       clock.tick(BATCH_DELAY);
 
-      expect(sentEvents()[0].data.bidders.adgeneration.status).to.equal('bid');
+      expect(sentEvents()[0].auctionEnd.bidders.adgeneration.status).to.equal('bid');
     });
 
     it('accumulates multiple BID_RESPONSE for the same bidder', () => {
@@ -454,7 +487,7 @@ describe('ADG Analytics Adapter', () => {
       events.emit(EVENTS.AUCTION_END, { auctionId: AUCTION_ID });
       clock.tick(BATCH_DELAY);
 
-      expect(sentEvents()[0].data.bidders.adgeneration.bids).to.have.lengthOf(2);
+      expect(sentEvents()[0].auctionEnd.bidders.adgeneration.bids).to.have.lengthOf(2);
     });
 
     it('sends one event per selected ADG bidId when a slot has several ADG bid requests', () => {
@@ -511,10 +544,12 @@ describe('ADG Analytics Adapter', () => {
       const [event] = sentEvents();
       expect(event.type).to.equal('bidWon');
       expect(event.bidId).to.equal(ADG_BID_ID);
-      expect(event.data.bidder).to.equal('adgeneration');
-      expect(event.data.cpm).to.equal(120.5);
+      expect(event.locationId).to.equal(ADG_LOCATION_ID);
+      expect(event.bidWon.bidder).to.equal('adgeneration');
+      expect(event.bidWon.cpm).to.equal(120.5);
       // adId は auctionEnd の bids[] と bidWon を突合するためのキー。
-      expect(event.data.adId).to.equal(AD_ID);
+      expect(event.bidWon.adId).to.equal(AD_ID);
+      expect(event).to.not.have.property('data');
     });
 
     it('sends a viewable event for a selected slot', () => {
@@ -530,7 +565,8 @@ describe('ADG Analytics Adapter', () => {
       const [event] = sentEvents();
       expect(event.type).to.equal('viewable');
       expect(event.bidId).to.equal(ADG_BID_ID);
-      expect(event.data.adId).to.equal(AD_ID);
+      expect(event.locationId).to.equal(ADG_LOCATION_ID);
+      expect(event.viewable.adId).to.equal(AD_ID);
     });
 
     it('sends an adRenderFailed event, resolving the slot by adId when no bid is attached', () => {
@@ -546,7 +582,8 @@ describe('ADG Analytics Adapter', () => {
       expect(event.bidId).to.equal(ADG_BID_ID);
       expect(event.auctionId).to.equal(AUCTION_ID);
       expect(event.adUnitCode).to.equal(AD_UNIT_CODE);
-      expect(event.data.reason).to.equal('cannotFindAd');
+      expect(event.locationId).to.equal(ADG_LOCATION_ID);
+      expect(event.adRenderFailed.reason).to.equal('cannotFindAd');
     });
 
     it('ignores follow-up events for slots that were not selected', () => {
@@ -755,8 +792,8 @@ describe('ADG Analytics Adapter', () => {
       const [event] = sentEvents();
       expect(event.bidId).to.equal(ADG_BID_ID);
       // disable 前に track した BID_RESPONSE が残っていること。
-      expect(event.data.bidders.adgeneration.status).to.equal('bid');
-      expect(event.data.bidders.rubicon.status).to.equal('requested');
+      expect(event.auctionEnd.bidders.adgeneration.status).to.equal('bid');
+      expect(event.auctionEnd.bidders.rubicon.status).to.equal('requested');
     });
 
     it('does not send pending events while disabled (consent withdrawn)', () => {

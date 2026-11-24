@@ -34,9 +34,10 @@ Each request body carries page-level values once, and an `events` array:
       "type": "auctionEnd",
       "ts": 1794386087018,
       "bidId": "6f1c2d3e-...",
+      "locationId": "58278",
       "auctionId": "a1b2c3",
       "adUnitCode": "div-1",
-      "data": {
+      "auctionEnd": {
         "bidders": {
           "adgeneration": { "status": "noBid" },
           "appnexus": { "status": "bid", "bids": [{ "adId": "x1", "cpm": 0.42, "currency": "JPY", "timeToRespond": 210 }] }
@@ -50,10 +51,17 @@ Each request body carries page-level values once, and an `events` array:
 - `bidId` is the `bidId` of the AdGeneration bid request for that ad unit (the
   same value as `imp.id` in the request sent to AdGeneration). It is available
   even when AdGeneration times out.
+- `locationId` is the AdGeneration ad unit ID that the publisher sets in the
+  bidder params (`params.id`) of that bid request, as a string (`null` if it is
+  not set). Each AdGeneration request is for one ad unit, so it is one per
+  `bidId`.
+- The data of each event is in a key named after its `type` (for example
+  `auctionEnd`, `bidWon`), so the receiver can read each type with its own
+  schema.
 - Consent data (`gdpr`, `gdprConsent`, `usPrivacy`, `gpp`, `gppSid`, `coppa`) is
   added to the top level when available.
 
-| `type`           | Sent on            | `data` |
+| `type`           | Sent on            | Data (in the key named after `type`) |
 |------------------|--------------------|--------|
 | `auctionEnd`     | `AUCTION_END`      | `bidders`: status of every bidder of the ad unit. `status` is `requested`, `bid`, `noBid`, `timeout` or `rejected`. A successful `BID_RESPONSE` always wins over the other statuses. Successful responses are collected in `bids`, rejected responses (with their `reason`) in `rejectedBids`. |
 | `bidWon`         | `BID_WON`          | `bidder` and the bid fields (`adId`, `cpm`, ...). |
@@ -78,7 +86,8 @@ Events are queued and sent together:
 
 Requests are sent with `navigator.sendBeacon()`; if it is unavailable the
 adapter falls back to an `ajax` POST with `keepalive`. The body is JSON sent as
-`text/plain` to avoid a CORS preflight.
+`text/plain` to avoid a CORS preflight. The send time in milliseconds is added
+to the endpoint URL as `t` (for example `?t=1794386087018`).
 
 #### Sampling
 
@@ -129,7 +138,7 @@ When analytics is enabled, the adapter loads a config file once per page
 ```json
 {
   "v": 1,
-  "endpoint": "https://d.socdm.com/adgen/analytics",
+  "endpoint": "https://rtb.socdm.com/pbanalytics/v1",
   "ratio": 0.1,
   "batchDelay": 1000
 }
@@ -138,7 +147,7 @@ When analytics is enabled, the adapter loads a config file once per page
 | Field        | Type     | Description |
 |--------------|----------|-------------|
 | `v`          | `number` | Format version. Only `1` is supported; any other value sends nothing. |
-| `endpoint`   | `string` | Endpoint that receives the events. Must be `https` on `socdm.com` or `scaleout.jp` (or their subdomains); otherwise nothing is sent. |
+| `endpoint`   | `string` | Endpoint that receives the events. Must be `https` on `socdm.com`, `scaleout.jp` or `ad-generation.jp` (or their subdomains); otherwise nothing is sent. |
 | `ratio`      | `number` | Ratio of AdGeneration bid requests to send, between `0` and `1`. An invalid value is treated as `0` (nothing is sent). |
 | `batchDelay` | `number` | Time in ms to wait from the first queued event before sending, between `0` and `5000`. Defaults to `1000`. `0` sends every event immediately. |
 

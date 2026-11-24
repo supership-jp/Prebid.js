@@ -17,8 +17,9 @@ export interface AdgenerationAnalyticsConfig {
   v: 1;
 
   /**
-   * Endpoint that receives the events. Must be https on socdm.com or
-   * scaleout.jp (or their subdomains). Nothing is sent without it.
+   * Endpoint that receives the events. Must be https on socdm.com,
+   * scaleout.jp or ad-generation.jp (or their subdomains). Nothing is sent
+   * without it. The send time is added to the URL as `t`.
    */
   endpoint: string;
 
